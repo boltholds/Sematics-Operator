@@ -24,6 +24,13 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--ridge", type=float, default=0.1, help="Positive regularization for compare"
     )
+    parser.add_argument(
+        "--pca-components",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Train-only PCA ranks for compare; enables exact-donor diagnostics",
+    )
     args = parser.parse_args(argv)
     try:
         cfg = load_settings(args.config, args.env_file, args.model)
@@ -48,6 +55,7 @@ def main(argv=None) -> int:
                 layers=args.layers,
                 strengths=args.strengths,
                 ridge=args.ridge,
+                pca_components=args.pca_components,
                 progress=print,
             )
             folder = save_steering(cfg.output_dir, report, tensors)

@@ -30,3 +30,57 @@ def test_conditional_experiment_preserves_weights_and_has_equal_selection_budget
         assert {"base", "constant", "conditional", "shuffled", "explicit_prompt"} == set(s)
     for k, v in before.items():
         assert torch.equal(v, lm.model.state_dict()[k])
+
+
+def test_pca_prediction_is_train_basis_projection_of_full_map():
+    from semantics_operator.conditional import fit_pca_map
+
+    generator = torch.Generator().manual_seed(10)
+    x = torch.randn(12, 6, generator=generator)
+    y = torch.randn(12, 6, generator=generator)
+    query = torch.randn(3, 6, generator=generator)
+    full = fit_map(x, y)
+    pca = fit_pca_map(x, y, components=2)
+    basis = pca["basis"].float()
+    expected = (predict(full, query) - full["mean_delta"].float()) @ basis.T @ basis + full[
+        "mean_delta"
+    ].float()
+    assert torch.allclose(predict(pca, query), expected, atol=1e-6)
+    assert pca["coefficients"].shape == (12, 2)
+    assert torch.allclose(basis @ basis.T, torch.eye(2), atol=1e-6)
+    zero = fit_pca_map(x, torch.ones_like(y), components=8)
+    assert zero["basis"].shape == (0, 6)
+    assert torch.equal(predict(zero, query), torch.ones(3, 6))
+
+
+def test_pca_selection_and_privileged_diagnostic_are_separate(tmp_path):
+    lm = tiny_model()
+    report, tensors = run_conditional(
+        lm, Settings("tiny", tmp_path), strengths=[0.0], pca_components=[2, 4]
+    )
+    for choices in report["selected"].values():
+        assert choices["pca_selected"]["variant"] == "pca_2"
+    assert report["oracle_diagnostics"]
+    for trials in report["validation_trials"].values():
+        assert "oracle" not in trials
+    assert any(k.endswith(".basis") for k in tensors)
+    for methods in report["oracle_diagnostics"].values():
+        assert (
+            methods["rollback"]["overall"]["accuracy"]
+            == report["scenarios"]["rollback"]["base"]["overall"]["accuracy"]
+        )
+
+
+def test_exact_donor_replacement_preserves_identical_prompt_scores():
+    from semantics_operator.conditional import row_scores
+    from semantics_operator.steering import evaluate
+    from semantics_operator.world import questions
+
+    lm = tiny_model()
+    samples = questions("test")[:3]
+    layer = lm.choose_target("")
+    donor = lm.representations([q.prompt() for q in samples], layer)
+    original = evaluate(lm, samples, {})
+    actual = row_scores(lm, samples, {layer: donor}, replace=True)
+    assert torch.allclose(actual, original, atol=1e-6)
+    assert not lm.model.get_submodule(layer)._forward_hooks

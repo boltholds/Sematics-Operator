@@ -44,7 +44,7 @@ def validation_questions():
 
 
 @torch.no_grad()
-def steered_scores(lm, prompts, edits):
+def steered_scores(lm, prompts, edits, *, replace=False):
     """Edit only the last prompt token, identically for both answer candidates.
 
     No candidate tokens enter extraction or the intervention-position choice.
@@ -58,7 +58,11 @@ def steered_scores(lm, prompts, edits):
             def hook(module, args, output, vector=vector):
                 result = output.clone()
                 rows = torch.arange(len(positions), device=output.device)
-                result[rows, positions] += vector.to(device=output.device, dtype=output.dtype)
+                change = vector.to(device=output.device, dtype=output.dtype)
+                if replace:
+                    result[rows, positions] = change
+                else:
+                    result[rows, positions] += change
                 return result
 
             handles.append(lm.model.get_submodule(target).register_forward_hook(hook))
@@ -236,7 +240,7 @@ def save_steering(root, report, vectors):
 
     from safetensors.torch import save_file
 
-    conditional = report["experiment"] == "state_conditioned_activation_v1"
+    conditional = report["experiment"].startswith("state_conditioned_activation_")
     kind = "compare" if conditional else "steering"
     folder = root / (datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + f"-{kind}-" + uuid4().hex[:8])
     folder.mkdir(parents=True, exist_ok=False)
@@ -285,5 +289,21 @@ def save_steering(root, report, vectors):
         "## Limitations",
         "",
     ] + ["- " + s for s in report["limitations"]]
+    if report.get("oracle_diagnostics"):
+        lines += [
+            "",
+            "## Privileged exact-donor diagnostics",
+            "",
+            "Donor prompts contain the intervention; these are not held-out learned predictions.",
+            "",
+            "| Layer | Scenario | Pair correct | All nodes correct |",
+            "|---|---|---:|---:|",
+        ]
+        for layer, scenarios in report["oracle_diagnostics"].items():
+            for name, metrics in scenarios.items():
+                c = metrics["consistency"]
+                lines.append(
+                    f"| {layer} | {name} | {value(c['relay_lamp_correct'])} | {value(c['all_nodes_correct'])} |"
+                )
     (folder / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return folder

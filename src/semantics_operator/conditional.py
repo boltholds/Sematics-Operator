@@ -35,12 +35,36 @@ def fit_map(states, deltas, ridge=0.1):
     }
 
 
+@torch.no_grad()
+def fit_pca_map(states, deltas, components, ridge=0.1):
+    if not isinstance(components, int) or components < 1:
+        raise ValueError("PCA components must be positive integers")
+    full = fit_map(states, deltas, ridge)
+    centered = deltas.double().cpu() - full["mean_delta"]
+    _, singular, vh = torch.linalg.svd(centered, full_matrices=False)
+    tolerance = singular.max() * max(centered.shape) * torch.finfo(torch.float64).eps
+    rank = int((singular > tolerance).sum())
+    k = min(components, rank, len(states) - 1)
+    basis = vh[:k].contiguous()
+    total = singular.square().sum()
+    energy = singular[:k].square().sum() / total if total > 0 else total
+    return {
+        **full,
+        "coefficients": full["coefficients"] @ basis.T,
+        "basis": basis,
+        "explained_variance_ratio": energy,
+    }
+
+
 def predict(model, states):
     x = (states.double().cpu() - model["center"]) / model["scale"]
-    return (model["mean_delta"] + (x @ model["features"].T) @ model["coefficients"]).float()
+    residual = (x @ model["features"].T) @ model["coefficients"]
+    if "basis" in model:
+        residual = residual @ model["basis"]
+    return (model["mean_delta"] + residual).float()
 
 
-def row_scores(lm, samples, edits):
+def row_scores(lm, samples, edits, *, replace=False):
     """Each question gets its own delta, duplicated identically for its two candidates."""
     return torch.cat(
         [
@@ -51,6 +75,7 @@ def row_scores(lm, samples, edits):
                     layer: delta[i : i + 2].repeat_interleave(2, dim=0)
                     for layer, delta in edits.items()
                 },
+                replace=replace,
             )
             for i in range(0, len(samples), 2)
         ]
@@ -58,7 +83,9 @@ def row_scores(lm, samples, edits):
 
 
 @torch.no_grad()
-def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress=lambda _: None):
+def run_conditional(
+    lm, cfg, *, layers=None, strengths=None, ridge=0.1, pca_components=(), progress=lambda _: None
+):
     # Hold the injection site fixed by default; optional identical layer search for all methods.
     layers = [lm.choose_target(cfg.target_module)] if layers is None else layers
     if not layers:
@@ -73,7 +100,10 @@ def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress
     samples = {"train": train, "validation": validation, "test": test}
     states = {split: {} for split in samples}
     models, tensors, fit_metrics = {}, {}, {}
-    methods = ("constant", "conditional", "shuffled")
+    if any(not isinstance(k, int) or k < 1 for k in pca_components):
+        raise ValueError("PCA components must be positive integers")
+    pca_components = sorted(set(pca_components))
+    methods = ("constant", "conditional", "shuffled", *(f"pca_{k}" for k in pca_components))
     trials = {op.key: {method: [] for method in methods} for op in OPERATORS}
     selected = {op.key: {} for op in OPERATORS}
     for layer in layers:
@@ -91,6 +121,7 @@ def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress
                 "conditional": fit_map(x, delta, ridge),
                 "shuffled": fit_map(x, delta[permutation], ridge),
             }
+            fitted.update({f"pca_{k}": fit_pca_map(x, delta, k, ridge) for k in pca_components})
             for method in methods:
                 model = fitted["conditional"] if method == "constant" else fitted[method]
                 models[op.key, layer, method] = model
@@ -108,6 +139,15 @@ def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress
                         (fitted_delta - delta).square().mean()
                     )
                 }
+                if "basis" in model:
+                    fit_metrics[prefix].update(
+                        {
+                            "effective_components": model["basis"].shape[0],
+                            "train_explained_variance_ratio": float(
+                                model["explained_variance_ratio"]
+                            ),
+                        }
+                    )
                 val_delta = (
                     model["mean_delta"].float().expand_as(states["validation"][layer])
                     if method == "constant"
@@ -123,12 +163,21 @@ def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress
                         selected[op.key][method] = entry
             progress(f"Selected so far: {op.key}: {selected[op.key]}")
 
+    if pca_components:
+        for op in OPERATORS:
+            variant = max(
+                (f"pca_{k}" for k in pca_components),
+                key=lambda m: selected[op.key][m]["validation_objective"],
+            )
+            selected[op.key]["pca_selected"] = {**selected[op.key][variant], "variant": variant}
+        methods = (*methods, "pca_selected")
+
     def edits_for(sequence, method):
         edits = {}
         for op in resolve_sequence(sequence):
             choice = selected[op.key][method]
             layer = choice["layer"]
-            model = models[op.key, layer, method]
+            model = models[op.key, layer, choice.get("variant", method)]
             x = states["test"][layer]
             delta = (
                 model["mean_delta"].float().expand_as(x)
@@ -150,12 +199,26 @@ def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress
             method: measurement(value, test, sequence, base_test)
             for method, value in scores.items()
         }
+    # Privileged diagnostic: paired donor prompts are allowed ONLY here, after selection.
+    oracle = {}
+    if pca_components:
+        for layer in layers:
+            oracle[layer] = {}
+            for name, sequence in SCENARIOS.items():
+                progress(f"Exact donor diagnostic: {layer}, {name}")
+                donor = capture_probes(lm, [q.prompt(sequence) for q in test], layer)
+                scores = row_scores(lm, test, {layer: donor}, replace=True)
+                oracle[layer][name] = measurement(scores, test, sequence, base_test)
     restored = evaluate(lm, test, {})
     difference = float((restored - base_test).abs().max())
     if not torch.allclose(restored, base_test, atol=1e-5, rtol=1e-5):
         raise RuntimeError("Conditional steering rollback failed")
     report = {
-        "experiment": "state_conditioned_activation_v1",
+        "experiment": "state_conditioned_activation_v2"
+        if pca_components
+        else "state_conditioned_activation_v1",
+        "pca_components": pca_components,
+        "oracle_diagnostics": oracle,
         "model": {
             "profile": cfg.profile,
             "path": str(cfg.model_path),
@@ -182,7 +245,10 @@ def run_conditional(lm, cfg, *, layers=None, strengths=None, ridge=0.1, progress
         "limitations": [
             "Conditional map has more parameters than constant baseline; shared data and selection budget do not imply equal capacity.",
             "Targets are prompted activations, not guaranteed correct semantic states; wording and answer bias can confound them.",
-            "Test states contain only unedited prompts, never intervention prompts or answers.",
+            "Learned methods see neutral test states only. Oracle diagnostics use paired intervention prompts and are not a deployable operator.",
+            "PCA is fit on centered train deltas only. Explained variance is not semantic correctness.",
+            "Each fixed PCA rank has the same selection grid; pca_selected searches more candidates across ranks.",
+            "Exact donor replacement covers one MLP output at one prompt position, not the entire model state.",
             "Composition sums deltas predicted from unedited states; it is not recursive state evolution.",
             "One seed and one shuffled-pair control; no significance claim.",
             "Same MLP last-prompt injection site as prior experiment; no weight edits.",
