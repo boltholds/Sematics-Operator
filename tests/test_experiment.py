@@ -33,6 +33,11 @@ def test_full_real_transformer_experiment_preserves_base_and_holds_out_test(tmp_
     assert len(report["scenarios"]["relay_0"]["weight_edit"]["records"]) == 40
     assert representations["baseline"].shape == (8, 16)
     assert any(p.norm() > 0 for p in patches.values())
+    assert not torch.equal(patches["relay_1"].b, patches["lamp_1"].b)
+    for stats in report["training_sampling"]["operators"].values():
+        assert stats["changed_presentations"] == cfg.steps
+        assert stats["unchanged_presentations"] == cfg.steps
+        assert all(n > 0 for n in stats["distinguishing_presentations"].values())
     for key, value in lm.model.state_dict().items():
         assert torch.equal(value, original[key])
     record = report["scenarios"]["relay_0"]["weight_edit"]["records"][0]

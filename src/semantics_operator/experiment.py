@@ -2,7 +2,6 @@
 
 import hashlib
 import platform
-import random
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -13,6 +12,7 @@ from torch.nn import functional as F
 
 from .config import Settings
 from .model import LocalLanguageModel
+from .sampling import coverage, training_batches
 from .weights import WeightPatch, WeightSession, randomized
 from .world import OPERATORS, Intervention, Node, Question, questions
 
@@ -117,14 +117,10 @@ def fit_operator(
 ) -> tuple[WeightPatch, list[float]]:
     session.reset(cfg.seed)  # Equal initialization and budget across primitive operators.
     optimizer = torch.optim.Adam(session.parameters(), lr=cfg.learning_rate)
-    rng = random.Random(cfg.seed)
-    order = list(range(len(samples)))
+    batches = training_batches(samples, intervention, steps=cfg.steps, seed=cfg.seed)
     losses = []
-    for step in range(cfg.steps):
-        if step % (len(samples) // 2) == 0:
-            rng.shuffle(order)
-        offset = (step * 2) % len(samples)
-        indices = order[offset : offset + 2]
+    for step, pair in enumerate(batches):
+        indices = list(pair)
         batch = [samples[i] for i in indices]
         scores = lm.scores([q.prompt() for q in batch])
         targets = torch.tensor([q.answer((intervention,)) for q in batch], device=lm.device)
@@ -205,7 +201,7 @@ def run_experiment(
     effective_settings["output_dir"] = str(cfg.output_dir)
     report = {
         "schema_version": 1,
-        "experiment": "supervised_weight_operator_v1",
+        "experiment": "supervised_weight_operator_v2",
         "claim": "Infrastructure and intervention-transfer benchmark; not evidence of general reasoning.",
         "settings": effective_settings,
         "model": {
@@ -234,6 +230,15 @@ def run_experiment(
             "training": "Primitive operations only; no composition/revision examples.",
         },
         "training_loss": histories,
+        "training_sampling": {
+            "strategy": "One changed and one unchanged question per step; early distinguishing witnesses; cyclic full-pool coverage.",
+            "operators": {
+                op.key: coverage(
+                    train, op, training_batches(train, op, steps=cfg.steps, seed=cfg.seed)
+                )
+                for op in OPERATORS
+            },
+        },
         "patch_norms": {key: patch.norm() for key, patch in patches.items()},
         "scenarios": scenarios,
         "rollback": {"max_score_difference": max_difference, "base_weight_unchanged": unchanged},
