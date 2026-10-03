@@ -209,6 +209,10 @@ def run_experiment(
         "claim": "Infrastructure and intervention-transfer benchmark; not evidence of general reasoning.",
         "settings": effective_settings,
         "model": {
+            "checkpoint_format": "gguf"
+            if cfg.model_path.suffix.lower() == ".gguf"
+            else "huggingface",
+            "dequantized": cfg.model_path.suffix.lower() == ".gguf",
             "class": type(lm.model).__name__,
             "target_module": target,
             "target_weight_sha256": base_hash,

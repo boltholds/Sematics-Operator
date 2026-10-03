@@ -14,6 +14,13 @@ device = "auto"
 dtype = "float32"
 target_module = ""
 
+# GGUF checkpoint relative to SO_MODELS_DIR (e.g. your LM Studio models folder).
+[models.lfm2_5_1_2b_gguf]
+path = "lmstudio-community/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q8_0.gguf"
+device = "auto"
+dtype = "float32"
+target_module = "" # Automatically selects an internal feed_forward.w2.
+
 [experiment]
 rank = 4
 steps = 30

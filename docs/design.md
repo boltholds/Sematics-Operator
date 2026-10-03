@@ -61,6 +61,27 @@ controls on changed consequences while retaining unrelated answers, across seeds
 A random tiny Transformer only verifies the pipeline. User-supplied pretrained models
 must be run before making any semantic or reasoning claim.
 
-Local safetensors models only; no remote model code or automatic downloads; no GGUF,
-bitsandbytes or sharded multi-device editing in v0.1. One active session per model/thread.
+Local safetensors models or standalone GGUF files; no remote model code or automatic
+downloads; no bitsandbytes, split-GGUF or sharded multi-device editing. One active session per model/thread.
 Original checkpoint files are never written. Reports and weights stay out of Git.
+
+## GGUF ingestion (v0.2)
+
+A GGUF path is detected by its file suffix. GGUF weights are dequantized through
+Transformers into floating-point tensors; the existing edit/session machinery is shared.
+LFM2 needs an explicit embedded-tokenizer converter because Transformers 4.57.6 has
+weight mapping but no LFM2 GGUF tokenizer converter. Its byte BPE vocabulary/merges,
+control/user tokens, BOS/EOS insertion flags and chat template are taken from GGUF.
+The `lfm2` pre-tokenizer follows llama.cpp's Llama-3 regex and merge behavior.
+
+The LFM2 RMS-norm epsilon mapping is corrected to `norm_eps`. Presence of `output.weight`
+determines whether output embeddings are tied. Incomplete weight loading is rejected,
+including any missing/mismatched/unexpected loading information. Auto-target selection
+recognizes `feed_forward.w2`. Reports identify the checkpoint format and dequantization.
+
+GGUF may require substantially more RAM than its on-disk size. FP32 dequantization
+occurs before placement in the configured dtype/device. No file conversion is written
+to the user's model directory. Tests generate F32 and Q8_0 GGUFs from a tiny hybrid LFM2,
+compare tensors and logits with a separately dequantized reference, check gradients and
+rollback, and run the full CLI. No claims are made about semantic results of a pretrained
+1.2B checkpoint based on these engineering tests.

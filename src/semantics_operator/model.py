@@ -24,7 +24,8 @@ class LocalLanguageModel:
     @classmethod
     def load(cls, settings: Settings):
         path = Path(settings.model_path)
-        if not (path / "config.json").is_file():
+        is_gguf = path.suffix.lower() == ".gguf"
+        if not is_gguf and not (path / "config.json").is_file():
             raise ValueError(f"Local HF model directory missing config.json: {path}")
         device = settings.device
         if device == "auto":
@@ -37,17 +38,22 @@ class LocalLanguageModel:
             )
         if device == "cpu" and settings.dtype == "float16":
             raise ValueError("Use float32 or bfloat16 for CPU experiments")
-        tokenizer = AutoTokenizer.from_pretrained(
-            path, local_files_only=True, trust_remote_code=False
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            path,
-            local_files_only=True,
-            trust_remote_code=False,
-            use_safetensors=True,
-            torch_dtype=getattr(torch, settings.dtype),
-            attn_implementation="eager",
-        )
+        if is_gguf:
+            from .gguf_loader import load_gguf
+
+            model, tokenizer = load_gguf(path, getattr(torch, settings.dtype))
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                path, local_files_only=True, trust_remote_code=False
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                path,
+                local_files_only=True,
+                trust_remote_code=False,
+                use_safetensors=True,
+                dtype=getattr(torch, settings.dtype),
+                attn_implementation="eager",
+            )
         if getattr(model.config, "quantization_config", None):
             raise ValueError("v0.1 requires unquantized floating-point HF weights")
         model.to(device).eval()
@@ -69,7 +75,9 @@ class LocalLanguageModel:
                 raise ValueError("Output-head editing is excluded; select an internal layer")
             return requested
         candidates = [
-            name for name in modules if name.endswith(("down_proj", "fc2", "dense_4h_to_h"))
+            name
+            for name in modules
+            if name.endswith(("down_proj", "fc2", "dense_4h_to_h", "feed_forward.w2"))
         ]
         if not candidates:
             raise ValueError(
