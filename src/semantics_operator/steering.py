@@ -236,18 +236,24 @@ def save_steering(root, report, vectors):
 
     from safetensors.torch import save_file
 
-    folder = root / (datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-steering-" + uuid4().hex[:8])
+    conditional = report["experiment"] == "state_conditioned_activation_v1"
+    kind = "compare" if conditional else "steering"
+    folder = root / (datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + f"-{kind}-" + uuid4().hex[:8])
     folder.mkdir(parents=True, exist_ok=False)
     (folder / "report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
     )
     save_file(
         vectors,
-        folder / "vectors.safetensors",
-        metadata={"position": "last prompt token", "space": "MLP output"},
+        folder / ("transitions.safetensors" if conditional else "vectors.safetensors"),
+        metadata={
+            "position": "last prompt token",
+            "space": "MLP output",
+            "experiment": report["experiment"],
+        },
     )
     lines = [
-        "# Contrastive activation experiment",
+        "# " + report["experiment"],
         "",
         "| Scenario | Method | Overall | Changed | Preserved correct | Pair correct | All nodes correct |",
         "|---|---|---:|---:|---:|---:|---:|",

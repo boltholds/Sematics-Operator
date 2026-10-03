@@ -77,3 +77,28 @@ def test_cli_steer_saves_vectors(tmp_path):
     assert report["experiment"] == "contrastive_activation_v1"
     assert all(choice["alpha"] == 0 for choice in report["selected"].values())
     assert (report_path.parent / "vectors.safetensors").is_file()
+
+
+def test_cli_compare_saves_transition_parameters(tmp_path):
+    from semantics_operator.cli import main
+
+    lm = tiny_model()
+    lm.model.save_pretrained(tmp_path / "weights")
+    lm.tokenizer.save_pretrained(tmp_path / "weights")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[models.test]\npath="weights"\ndevice="cpu"\n[experiment]\noutput_dir="runs"\n'
+    )
+    env = tmp_path / ".env"
+    env.write_text(f"SO_MODELS_DIR={tmp_path.as_posix()}\nSO_MODEL=test\n")
+    assert (
+        main(["compare", "--config", str(config), "--env-file", str(env), "--strengths", "0"]) == 0
+    )
+    path = next((tmp_path / "runs").glob("*-compare-*/report.json"))
+    report = json.loads(path.read_text())
+    assert report["experiment"] == "state_conditioned_activation_v1"
+    from safetensors.torch import load_file
+
+    assert any(
+        k.endswith(".coefficients") for k in load_file(path.parent / "transitions.safetensors")
+    )

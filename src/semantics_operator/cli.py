@@ -8,7 +8,7 @@ from .config import load_settings
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Reversible weight-space semantic experiments")
-    parser.add_argument("command", choices=("inspect", "run", "steer"))
+    parser.add_argument("command", choices=("inspect", "run", "steer", "compare"))
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default="", help="Named model profile in TOML")
@@ -20,6 +20,9 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--strengths", nargs="+", type=float, help="Validation steering grid; zero always included"
+    )
+    parser.add_argument(
+        "--ridge", type=float, default=0.1, help="Positive regularization for compare"
     )
     args = parser.parse_args(argv)
     try:
@@ -34,6 +37,21 @@ def main(argv=None) -> int:
             for name, shape in lm.linear_modules().items():
                 print(f"{name}\t{shape}")
             print("Select an internal Linear module in the model profile target_module field.")
+            return 0
+        if args.command == "compare":
+            from .conditional import run_conditional
+            from .steering import save_steering
+
+            report, tensors = run_conditional(
+                lm,
+                cfg,
+                layers=args.layers,
+                strengths=args.strengths,
+                ridge=args.ridge,
+                progress=print,
+            )
+            folder = save_steering(cfg.output_dir, report, tensors)
+            print(f"Results: {folder}")
             return 0
         if args.command == "steer":
             from .steering import run_steering, save_steering
