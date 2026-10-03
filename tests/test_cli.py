@@ -42,3 +42,38 @@ def test_cli_missing_model_gives_actionable_error(tmp_path, capsys):
     config.write_text('default_model="missing"\n[models.missing]\npath="absent"\n')
     assert main(["inspect", "--config", str(config), "--env-file", str(tmp_path / ".env")]) == 2
     assert "config.json" in capsys.readouterr().err
+
+
+def test_cli_steer_saves_vectors(tmp_path):
+    from semantics_operator.cli import main
+
+    lm = tiny_model()
+    lm.model.save_pretrained(tmp_path / "weights")
+    lm.tokenizer.save_pretrained(tmp_path / "weights")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[models.test]\npath="weights"\ndevice="cpu"\n[experiment]\noutput_dir="runs"\n'
+    )
+    env = tmp_path / ".env"
+    env.write_text(f"SO_MODELS_DIR={tmp_path.as_posix()}\nSO_MODEL=test\n")
+    assert (
+        main(
+            [
+                "steer",
+                "--config",
+                str(config),
+                "--env-file",
+                str(env),
+                "--layers",
+                "model.layers.0.mlp.down_proj",
+                "--strengths",
+                "0",
+            ]
+        )
+        == 0
+    )
+    report_path = next((tmp_path / "runs").glob("*/report.json"))
+    report = json.loads(report_path.read_text())
+    assert report["experiment"] == "contrastive_activation_v1"
+    assert all(choice["alpha"] == 0 for choice in report["selected"].values())
+    assert (report_path.parent / "vectors.safetensors").is_file()
