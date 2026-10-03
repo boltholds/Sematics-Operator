@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local models, experiment results and machine-specific configuration
+models/
+runs/
+.env.*
+!.env.example
+configs/*.local.toml
+*.safetensors
+*.gguf
+*.pt
+*.pth

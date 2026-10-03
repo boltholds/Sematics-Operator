@@ -1,0 +1,26 @@
+default_model = "small"
+
+[models.small]
+# Relative to SO_MODELS_DIR. Must contain HF config, tokenizer and weights.
+path = "my-small-model"
+device = "auto"
+dtype = "float32"
+# Run `semop inspect` to list exact Linear module names. Empty = middle MLP auto-selection.
+target_module = ""
+
+[models.second]
+path = "my-second-model"
+device = "auto"
+dtype = "float32"
+target_module = ""
+
+[experiment]
+rank = 4
+steps = 30
+learning_rate = 0.003
+locality_weight = 0.5
+regularization = 0.0001
+max_length = 512
+seed = 42
+# Relative to this TOML file:
+output_dir = "../runs"
