@@ -116,3 +116,40 @@ def test_cli_compare_saves_transition_parameters(tmp_path):
     assert any(
         k.endswith(".coefficients") for k in load_file(path.parent / "transitions.safetensors")
     )
+
+
+def test_cli_localize_saves_diagnostic(tmp_path):
+    from semantics_operator.cli import main
+
+    lm = tiny_model()
+    lm.model.save_pretrained(tmp_path / "weights")
+    lm.tokenizer.save_pretrained(tmp_path / "weights")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[models.test]\npath="weights"\ndevice="cpu"\n[experiment]\noutput_dir="runs"\n'
+    )
+    env = tmp_path / ".env"
+    env.write_text(f"SO_MODELS_DIR={tmp_path.as_posix()}\nSO_MODEL=test\n")
+    assert (
+        main(
+            [
+                "localize",
+                "--config",
+                str(config),
+                "--env-file",
+                str(env),
+                "--layer-sets",
+                "0,1",
+                "--windows",
+                "1",
+                "--boundaries",
+                "decision",
+            ]
+        )
+        == 0
+    )
+    path = next((tmp_path / "runs").glob("*-localize-*/report.json"))
+    report = json.loads(path.read_text())
+    assert report["experiment"] == "donor_localization_v1"
+    assert report["layer_sets"] == [[0, 1]]
+    assert (path.parent / "summary.md").is_file()

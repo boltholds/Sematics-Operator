@@ -8,7 +8,7 @@ from .config import load_settings
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Reversible weight-space semantic experiments")
-    parser.add_argument("command", choices=("inspect", "run", "steer", "compare"))
+    parser.add_argument("command", choices=("inspect", "run", "steer", "compare", "localize"))
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default="", help="Named model profile in TOML")
@@ -31,6 +31,18 @@ def main(argv=None) -> int:
         default=[],
         help="Train-only PCA ranks for compare; enables exact-donor diagnostics",
     )
+    parser.add_argument(
+        "--layer-sets", nargs="+", help="Layer index sets for localize, e.g. 8 6,7,8 2,5,8"
+    )
+    parser.add_argument(
+        "--windows", nargs="+", type=int, help="Last aligned token counts for localize"
+    )
+    parser.add_argument(
+        "--boundaries",
+        nargs="+",
+        choices=("prompt", "decision"),
+        help="Patch before or after common answer prefix",
+    )
     args = parser.parse_args(argv)
     try:
         cfg = load_settings(args.config, args.env_file, args.model)
@@ -44,6 +56,25 @@ def main(argv=None) -> int:
             for name, shape in lm.linear_modules().items():
                 print(f"{name}\t{shape}")
             print("Select an internal Linear module in the model profile target_module field.")
+            return 0
+        if args.command == "localize":
+            from .localization import run_localization, save_localization
+
+            groups = (
+                [tuple(int(i) for i in group.split(",")) for group in args.layer_sets]
+                if args.layer_sets
+                else None
+            )
+            report = run_localization(
+                lm,
+                cfg,
+                layer_sets=groups,
+                windows=args.windows,
+                boundaries=args.boundaries,
+                progress=print,
+            )
+            folder = save_localization(cfg.output_dir, report)
+            print(f"Results: {folder}")
             return 0
         if args.command == "compare":
             from .conditional import run_conditional
