@@ -60,6 +60,43 @@ def capture_tail(lm, prompts, sites, window, prefix):
 
 
 @torch.no_grad()
+def capture_scoring_tail(lm, prompts, sites, window, *, candidates):
+    """Capture prompt tails in the exact candidate-scoring forward layout.
+
+    Returns [prompt, candidate, token, hidden] per site. The candidate axis
+    retains each row's floating-point result; the captured positions precede
+    every answer token. Reusing scores() keeps padding, row order and sequence
+    lengths identical to the recipient's scoring pass for a self-patch.
+    """
+    ends = [len(lm._prompt_ids(p)) for p in prompts for _ in candidates]
+    if not ends or window < 1 or min(ends) < window:
+        raise ValueError("Token window exceeds available sequence")
+    captures, handles = {}, []
+    try:
+        for site in sites:
+
+            def hook(module, args, output, site=site):
+                tensor = hidden(output)
+                if tensor.shape[0] != len(ends):
+                    raise ValueError("Captured rows must match candidate scoring")
+                captures[site] = torch.stack(
+                    [
+                        tensor[row, end - window : end].detach().float().cpu()
+                        for row, end in enumerate(ends)
+                    ]
+                ).reshape(len(prompts), len(candidates), window, tensor.shape[-1])
+
+            handles.append(lm.model.get_submodule(site).register_forward_hook(hook))
+        lm.scores(prompts, candidates=candidates)
+        if set(captures) != set(sites):
+            raise ValueError("Some localization sites did not execute")
+    finally:
+        for handle in handles:
+            handle.remove()
+    return captures
+
+
+@torch.no_grad()
 def patched_scores(
     lm, prompts, donor, sites, window, prefix, *, replace=True, candidates=(" 0", " 1")
 ):
@@ -70,7 +107,13 @@ def patched_scores(
 
             def hook(module, args, output, site=site):
                 tensor = hidden(output).clone()
-                values = donor[site][:, -window:].repeat_interleave(2, dim=0).to(tensor)
+                states = donor[site]
+                if states.ndim == 4:
+                    if states.shape[:2] != (len(prompts), 2):
+                        raise ValueError("Scoring donors need two candidate rows per prompt")
+                    values = states[:, :, -window:].flatten(0, 1).to(tensor)
+                else:
+                    values = states[:, -window:].repeat_interleave(2, dim=0).to(tensor)
                 for row, end in enumerate(ends):
                     if replace:
                         tensor[row, end - window : end] = values[row]
