@@ -3,6 +3,7 @@
 import json
 import random
 from datetime import UTC, datetime
+from functools import partial
 from uuid import uuid4
 
 import torch
@@ -12,6 +13,7 @@ from .answer_protocol import protocol_metadata
 from .causal_tasks import (
     TRAIN_SCHEMES,
     InterventionMode,
+    PromptLayout,
     PromptStyle,
     Scheme,
     circuit_questions,
@@ -34,6 +36,7 @@ from .generation_evaluation import (
     generation_metrics,
 )
 from .localization import capture_tail, discover_sites
+from .positions import ReftPosition, intervention_positions, validate_state_prefixes
 from .reft import LoReFT, frozen_model, intervention_scores, task_locality_loss
 from .reft_localization import locate_block
 from .world import OPERATORS
@@ -47,21 +50,35 @@ def block_site(lm, layer):
 
 
 @torch.no_grad()
-def capture_states(lm, prompts, site, prefix):
+def capture_states(lm, prompts, site, prefix, *, position=ReftPosition.ANSWER):
     return torch.cat(
         [
-            capture_tail(lm, prompts[i : i + 2], [site], 1, prefix)[site][:, 0]
+            capture_tail(
+                lm,
+                prompts[i : i + 2],
+                [site],
+                1,
+                prefix,
+                positions=intervention_positions(lm, prompts[i : i + 2], position),
+            )[site][:, 0]
             for i in range(0, len(prompts), 2)
         ]
     )
 
 
 @torch.no_grad()
-def evaluate(lm, samples, site, prefix, transform=lambda h: h, sequence=()):
+def evaluate(
+    lm, samples, site, prefix, transform=lambda h: h, sequence=(), *, position=ReftPosition.ANSWER
+):
     return torch.cat(
         [
             intervention_scores(
-                lm, [q.prompt(sequence) for q in samples[i : i + 2]], site, prefix, transform
+                lm,
+                [q.prompt(sequence) for q in samples[i : i + 2]],
+                site,
+                prefix,
+                transform,
+                position=position,
             ).cpu()
             for i in range(0, len(samples), 2)
         ]
@@ -117,6 +134,7 @@ def train_loreft(
     *,
     loss_mode=LossMode.BINARY,
     full_reference=None,
+    position=ReftPosition.ANSWER,
 ):
     loss_mode = LossMode(loss_mode)
     if loss_mode == LossMode.FULL_VOCAB and full_reference is None:
@@ -138,7 +156,12 @@ def train_loreft(
             if loss_mode == LossMode.FULL_VOCAB:
                 targets = answer_sequences(lm, [q.answer((op,)) for q in micro])
                 token_logits = teacher_forced_logits(
-                    lm, [q.prompt() for q in micro], targets, site=site, transform=model
+                    lm,
+                    [q.prompt() for q in micro],
+                    targets,
+                    site=site,
+                    transform=model,
+                    position=position,
                 )
                 loss, chunk_parts, details = full_vocab_loss(
                     token_logits,
@@ -161,7 +184,9 @@ def train_loreft(
                         **detail,
                     }
                 continue
-            scores = intervention_scores(lm, [q.prompt() for q in micro], site, prefix, model)
+            scores = intervention_scores(
+                lm, [q.prompt() for q in micro], site, prefix, model, position=position
+            )
             labels = torch.tensor([q.answer((op,)) for q in micro], device=lm.device)
             affected = torch.tensor(
                 [q.node in q.world.affected(op) for q in micro], device=lm.device
@@ -206,6 +231,7 @@ def train_loreft(
     return model.eval(), {
         "locality_weight": locality,
         "loss_mode": loss_mode.value,
+        "position": ReftPosition(position).value,
         "schemes": [s.value for s in dict.fromkeys(q.world.scheme for q in samples)],
         "batching": "full_state",
         "microbatch_size": 2,
@@ -228,6 +254,7 @@ def run_reft_suite(
     preservation_weight=1.0,
     loss_mode=LossMode.FULL_VOCAB,
     train_schemes=TRAIN_SCHEMES,
+    position=ReftPosition.STATE,
     progress=lambda _: None,
 ):
     strengths = [0, 0.5, 1, 2] if strengths is None else strengths
@@ -246,8 +273,18 @@ def run_reft_suite(
     if loss_mode == LossMode.FULL_VOCAB:
         answer_protocol["training_completion_ids"] = answer_sequences(lm, [0, 1])
     prefix = []
-    train = training_questions("train", train_schemes, styles=tuple(PromptStyle))
-    val = training_questions("validation", train_schemes)
+    position = ReftPosition(position)
+    evaluate_at = partial(evaluate, position=position)
+    capture_at = partial(capture_states, position=position)
+    train = training_questions(
+        "train", train_schemes, styles=tuple(PromptStyle), layout=PromptLayout.STATE_FIRST
+    )
+    val = training_questions("validation", train_schemes, layout=PromptLayout.STATE_FIRST)
+    prefix_checks = {
+        "train": validate_state_prefixes(lm, train),
+        "validation": validate_state_prefixes(lm, val),
+        "test": {},
+    }
     train_schemes = tuple(dict.fromkeys(q.world.scheme for q in train))
     methods = (
         "constant",
@@ -264,16 +301,20 @@ def run_reft_suite(
             preservation_weight,
             progress,
             samples=val,
+            position=position,
         )
-        base_train, base_val = evaluate(lm, train, site, prefix), evaluate(lm, val, site, prefix)
-        x = capture_states(lm, [q.prompt() for q in train], site, prefix)
+        base_train, base_val = (
+            evaluate_at(lm, train, site, prefix),
+            evaluate_at(lm, val, site, prefix),
+        )
+        x = capture_at(lm, [q.prompt() for q in train], site, prefix)
         full_reference = None
         if loss_mode == LossMode.FULL_VOCAB:
             progress("Caching full-vocabulary protected distributions (CPU)")
             full_reference = reference_distributions(lm, train)
         for op in OPERATORS:
             progress(f"Training and selecting {op.key}")
-            donor = capture_states(lm, [q.prompt((op,)) for q in train], site, prefix)
+            donor = capture_at(lm, [q.prompt((op,)) for q in train], site, prefix)
             delta = donor - x
             fitted[op.key] = {"ridge": fit_map(x, delta), "constant": delta.mean(0)}
             for k in sorted(set(pca_components)):
@@ -296,6 +337,7 @@ def run_reft_suite(
                     progress,
                     loss_mode=loss_mode,
                     full_reference=full_reference,
+                    position=position,
                 )
                 fitted[op.key][method], training[op.key][method] = model, log
             selected[op.key], trials[op.key] = {}, {}
@@ -315,7 +357,9 @@ def run_reft_suite(
                     scores = (
                         base_val
                         if alpha == 0
-                        else evaluate(lm, val, site, prefix, make_transform(model, method, alpha))
+                        else evaluate_at(
+                            lm, val, site, prefix, make_transform(model, method, alpha)
+                        )
                     )
                     m = metrics(scores, val, (op,), base_val)
                     entry = {
@@ -324,6 +368,7 @@ def run_reft_suite(
                         "all_nodes_correct": m["all_nodes_correct"],
                         "relay_lamp_correct": m["relay_lamp_correct"],
                         "protected_damage": m["protected_damage"],
+                        "equation_consistency": m["equation_consistency"],
                         **{k: m[k] for k in ("overall", "changed", "by_node", "by_label")},
                     }
                     trials[op.key][method].append(entry)
@@ -334,23 +379,34 @@ def run_reft_suite(
         fixed = {
             "alpha": 1.0,
             "used_for_selection": False,
-            "train": fixed_loreft_metrics(lm, train, base_train, site, prefix, fitted),
-            "validation": fixed_loreft_metrics(lm, val, base_val, site, prefix, fitted),
+            "train": fixed_loreft_metrics(
+                lm, train, base_train, site, prefix, fitted, position=position
+            ),
+            "validation": fixed_loreft_metrics(
+                lm, val, base_val, site, prefix, fitted, position=position
+            ),
             "test": {},
         }
         tests, exact, greedy = {}, {}, {}
         for scheme in Scheme:
             progress(f"Held-out evaluation: {scheme.value}")
-            samples = circuit_questions("test", scheme)
-            base = evaluate(lm, samples, site, prefix)
+            samples = circuit_questions("test", scheme, layout=PromptLayout.STATE_FIRST)
+            prefix_checks["test"][scheme.value] = validate_state_prefixes(lm, samples)
+            base = evaluate_at(lm, samples, site, prefix)
             fixed["test"][scheme.value] = fixed_loreft_metrics(
-                lm, samples, base, site, prefix, fitted
+                lm,
+                samples,
+                base,
+                site,
+                prefix,
+                fitted,
+                position=position,
             )
             tests[scheme.value], exact[scheme.value] = {}, {}
             for name, sequence in SCENARIOS.items():
                 modes = {
                     "base": base,
-                    "explicit_prompt": evaluate(lm, samples, site, prefix, sequence=sequence),
+                    "explicit_prompt": evaluate_at(lm, samples, site, prefix, sequence=sequence),
                 }
                 for method in methods:
                     transforms = [
@@ -365,11 +421,11 @@ def run_reft_suite(
                             h = transform(h)
                         return h
 
-                    modes[method] = evaluate(lm, samples, site, prefix, compose)
+                    modes[method] = evaluate_at(lm, samples, site, prefix, compose)
                 tests[scheme.value][name] = {
                     m: metrics(s, samples, sequence, base) for m, s in modes.items()
                 }
-                donor = capture_states(lm, [q.prompt(sequence) for q in samples], site, prefix)
+                donor = capture_at(lm, [q.prompt(sequence) for q in samples], site, prefix)
                 rows = []
                 for i in range(0, len(samples), 2):
                     values = donor[i : i + 2].repeat_interleave(2, 0).to(lm.device)
@@ -381,6 +437,7 @@ def run_reft_suite(
                                 site,
                                 prefix,
                                 lambda h, values=values: values.to(h),
+                                position=position,
                             ).cpu()
                         )
                 exact[scheme.value][name] = metrics(torch.cat(rows), samples, sequence, base)
@@ -395,13 +452,16 @@ def run_reft_suite(
                 fixed["test"][scheme.value],
                 max_new_tokens,
                 progress,
+                position=position,
             )
-        restored = evaluate(lm, train, site, prefix)
+        restored = evaluate_at(lm, train, site, prefix)
         difference = float((restored - base_train).abs().max())
         if not torch.allclose(restored, base_train, atol=1e-5, rtol=1e-5):
             raise RuntimeError("LoReFT rollback failed")
     return {
-        "experiment": "loreft_causal_suite_v4",
+        "experiment": "loreft_causal_suite_v5",
+        "prompt_layout": PromptLayout.STATE_FIRST.value,
+        "state_prefix_checks": prefix_checks,
         "loss_mode": loss_mode.value,
         "intervention_mode": InterventionMode.REPLACE_EQUATION.value,
         "answer_protocol": answer_protocol,
@@ -415,7 +475,13 @@ def run_reft_suite(
         "locality_weight": cfg.locality_weight,
         "preservation_weight": preservation_weight,
         "strengths": strengths,
-        "site": {"path": site, "kind": "block", "boundary": "prompt", "prefix": prefix},
+        "site": {
+            "path": site,
+            "kind": "block",
+            "boundary": "state" if position == ReftPosition.STATE else "prompt",
+            "position": position.value,
+            "prefix": prefix,
+        },
         "train_schemes": [s.value for s in train_schemes],
         "test_groups": {
             "seen_mechanisms": [s.value for s in train_schemes],
@@ -443,8 +509,10 @@ def run_reft_suite(
             "Native LoReFT equation with QR basis and identity initialization; not a reproduction of paper benchmarks or the pyreft optimizer setup.",
             "Full-vocabulary mode uses token CE including one EOS and forward KL over the complete vocabulary; binary mode retains the two-candidate objective. Alpha selection and non-greedy metrics still use bare 0/1 ranking without EOS.",
             "Protected KL uses the same teacher-forced natural answer history for baseline and intervention, averaged over its tokens including EOS. It does not constrain arbitrary generated histories.",
-            "The first configured EOS ID is the training target; generation accepts all configured stop IDs. The intervention stays at the original prompt position. An edit at the final block cannot influence later teacher-forced positions, so an EOS objective alone cannot guarantee completion.",
-            "Task labels supervise affected variables; locality preserves every unaffected query, including relay for lamp edits. Symbolic masks are used only in training.",
+            "The first configured EOS ID is the training target; generation accepts all configured stop IDs. The intervention position is fixed during decoding. An edit at the final block cannot influence later positions; this is a negative control for state-position experiments.",
+            "Task labels supervise affected variables; locality and preservation metrics cover all structurally unaffected nodes, including relay and bridge for lamp edits. Symbolic masks are used in supervision and evaluation, never given to the operator at inference.",
+            "Equation consistency checks predicted parents under the intervened equations. Consistent but wrong input states can pass this check; all_nodes_correct independently requires the complete correct counterfactual state. Invalid/missing answers fail dependent equations.",
+            "Selection first maximizes all_nodes_correct minus the full unaffected-node damage penalty, then equation consistency, relay/lamp accuracy and overall accuracy. Equation checks are evaluation criteria, not an additional training loss.",
             "Locality is a soft training objective, not a guarantee. loreft_task is an identically initialized zero-locality ablation.",
             "Each step contains every role for one world/style, with microbatch accumulation. Training schemes alternate; within each scheme changed/stable worlds alternate. Validation and held-out evaluation use the default wording; train uses three styles.",
             "Training by-node losses are measured before each update on the scheduled batch; fixed-alpha train metrics evaluate the final operator on every training question.",
@@ -453,9 +521,12 @@ def run_reft_suite(
             "Compositions sequentially transform the same hidden vector; they do not rerun the network between primitive operators.",
             "Revision uses external latest-write-wins resolution, not learned contradiction detection.",
             "COPY and NOT are the default training mechanisms; other mechanisms and all bridge topologies remain test-only. Seen-mechanism test wording is reported separately from held-out structures. All tasks use Boolean variables and the same names; no arbitrary-text reasoning claim.",
-            "Candidate layer list may reflect earlier experiments. One shared block is selected by mean validation donor-transfer objectives; this need not be the best layer for learned LoReFT. Training continues even if no donor site beats the no-patch baseline, with that outcome explicitly recorded.",
+            "Candidate layer list may reflect earlier experiments. One shared block is selected by validation donor transfer; this need not be the best layer for learned LoReFT. The final block is excluded from state-position selection. Training continues if no eligible donor site beats baseline, with that outcome recorded.",
             "Validation donors select the intervention site; test donors remain separate privileged diagnostics. Shifted schemes never participate in fitting or selection. Base model weights remain frozen.",
-            "Scoring, training and free generation intervene at the same last prompt token with bare 0/1 candidates and no forced prefix. Greedy decoding uses the full vocabulary, so it can disagree with binary ranking or fail the required format.",
+            "v5 uses the same state-first prompts for state and answer positions. State edits use the last token wholly inside the marked description before the question; answer edits use the last prompt token. Fast-tokenizer offsets must match actual chat tokenization. QUERY_FIRST wording moves its query after the description in this layout.",
+            "State-mode token prefixes are checked to be identical across question roles for every world/style. Causal forwards recompute that state per question; tiny activation differences from numerical kernels are reported at validation localization. No shared KV cache or persistent edited world is claimed.",
+            "One state token may not encode the whole circuit. This experiment tests whether later blocks can use its intervention across questions; it does not guarantee a causal abstraction. Names and scheme identifiers are not randomized.",
+            "Scoring, teacher forcing and free generation edit the same resolved token with bare 0/1 candidates and no forced answer prefix. Greedy decoding uses the full vocabulary and can disagree with binary ranking or fail the required format.",
             "Greedy diagnostics evaluate primitive LoReFT operators at both selected strength and alpha=1. Compositions are still evaluated by candidate scoring only.",
             "Truncated generation counts as incomplete even when its partial text is a digit; it is not a completed binary answer. Unaffected-answer damage is relative to correct baseline generations, not candidate predictions.",
         ],
@@ -463,7 +534,17 @@ def run_reft_suite(
 
 
 def greedy_loreft_metrics(
-    lm, samples, site, fitted, selected, selected_scores, fixed_scores, max_new_tokens, progress
+    lm,
+    samples,
+    site,
+    fitted,
+    selected,
+    selected_scores,
+    fixed_scores,
+    max_new_tokens,
+    progress,
+    *,
+    position=ReftPosition.ANSWER,
 ):
     def generate(label, transform=lambda h: h, sequence=()):
         return generate_questions(
@@ -474,6 +555,7 @@ def greedy_loreft_metrics(
             sequence=sequence,
             max_new_tokens=max_new_tokens,
             progress=lambda message: progress(f"Greedy {label}: {message}"),
+            position=position,
         )
 
     base = generate("base")
@@ -507,14 +589,19 @@ def greedy_loreft_metrics(
     return result
 
 
-def fixed_loreft_metrics(lm, samples, base, site, prefix, fitted):
+def fixed_loreft_metrics(lm, samples, base, site, prefix, fitted, *, position=ReftPosition.ANSWER):
     """Predeclared unit-strength diagnostics; no donor and no selection side effects."""
     result = {}
     for op in OPERATORS:
         result[op.key] = {"base": metrics(base, samples, (op,), base)}
         for method in ("loreft_task", "loreft_locality"):
             scores = evaluate(
-                lm, samples, site, prefix, make_transform(fitted[op.key][method], method, 1.0)
+                lm,
+                samples,
+                site,
+                prefix,
+                make_transform(fitted[op.key][method], method, 1.0),
+                position=position,
             )
             result[op.key][method] = metrics(scores, samples, (op,), base)
     return result
@@ -554,6 +641,7 @@ def save_research(root, report, tensors):
             "## Run protocol",
             "",
             f"Loss: `{report.get('loss_mode', 'binary')}`; intervention: `{report.get('intervention_mode', 'legacy_override')}`.",
+            f"Position: `{report['site'].get('position', 'answer')}`; prompt layout: `{report.get('prompt_layout', 'legacy')}`.",
             "",
             "Training / validation mechanisms: "
             + ", ".join(report.get("train_schemes", ["and_copy"]))
@@ -565,8 +653,8 @@ def save_research(root, report, tensors):
             "",
         ]
         lines += [
-            "| Scheme | Scenario | Method | Accuracy | All nodes | New protected errors |",
-            "|---|---|---|---:|---:|---:|",
+            "| Scheme | Scenario | Method | Accuracy | All nodes | Equations consistent | New protected errors |",
+            "|---|---|---|---:|---:|---:|---:|",
         ]
         for scheme, scenarios in report["test"].items():
             for name, methods in scenarios.items():
@@ -575,7 +663,7 @@ def save_research(root, report, tensors):
                     "exact_donor": report["oracle_diagnostics"][scheme][name],
                 }.items():
                     lines.append(
-                        f"| {scheme} | {name} | {method} | {m['overall']['accuracy']:.3f} | {m['all_nodes_correct']:.3f} | {m['protected_damage']['damaged']} |"
+                        f"| {scheme} | {name} | {method} | {m['overall']['accuracy']:.3f} | {m['all_nodes_correct']:.3f} | {m['equation_consistency']['all_satisfied']:.3f} | {m['protected_damage']['damaged']} |"
                     )
         lines += [
             "",
@@ -591,8 +679,8 @@ def save_research(root, report, tensors):
                 "",
                 "## Fixed alpha=1 diagnostics (not used for selection)",
                 "",
-                "| Split / scheme | Operation | Method | Accuracy | Changed | All nodes | Source / switch / flag damage |",
-                "|---|---|---|---:|---:|---:|---|",
+                "| Split / scheme | Operation | Method | Accuracy | Changed | All nodes | Equations consistent | Protected damage by node |",
+                "|---|---|---|---:|---:|---:|---:|---|",
             ]
             groups = {
                 "train": fixed["train"],
@@ -604,13 +692,14 @@ def save_research(root, report, tensors):
                     for method, m in methods.items():
                         damage = m["protected_damage"]["by_node"]
                         values = " / ".join(
-                            f"{damage[n]['damaged']}/{damage[n]['eligible']}"
-                            for n in ("source", "switch", "flag")
+                            f"{n}: {v['damaged']}/{v['eligible']}"
+                            for n, v in damage.items()
+                            if v["eligible"]
                         )
                         changed = m["changed"]["accuracy"]
                         changed_text = "n/a" if changed is None else f"{changed:.3f}"
                         lines.append(
-                            f"| {split} | {op} | {method} | {m['overall']['accuracy']:.3f} | {changed_text} | {m['all_nodes_correct']:.3f} | {values} |"
+                            f"| {split} | {op} | {method} | {m['overall']['accuracy']:.3f} | {changed_text} | {m['all_nodes_correct']:.3f} | {m['equation_consistency']['all_satisfied']:.3f} | {values or 'n/a'} |"
                         )
         if "localization" in report:
             lines += [
@@ -628,19 +717,20 @@ def save_research(root, report, tensors):
                 "",
                 "## Unconstrained greedy generation",
                 "",
-                "| Scheme | Operation | Mode | Accuracy | All nodes | Format errors | Incomplete | Source / switch / flag damage |",
-                "|---|---|---|---:|---:|---:|---:|---|",
+                "| Scheme | Operation | Mode | Accuracy | All nodes | Equations consistent | Format errors | Incomplete | Protected damage by node |",
+                "|---|---|---|---:|---:|---:|---:|---:|---|",
             ]
             for scheme, operations in report["greedy_test"].items():
                 for op, modes in operations.items():
                     for mode, m in modes.items():
                         damage = m["protected_damage"]["by_node"]
                         values = " / ".join(
-                            f"{damage[n]['damaged']}/{damage[n]['eligible']}"
-                            for n in ("source", "switch", "flag")
+                            f"{n}: {v['damaged']}/{v['eligible']}"
+                            for n, v in damage.items()
+                            if v["eligible"]
                         )
                         lines.append(
-                            f"| {scheme} | {op} | {mode} | {m['overall']['accuracy']:.3f} | {m['all_nodes_correct']:.3f} | {m['overall']['format_errors']} | {m['overall']['incomplete']} | {values} |"
+                            f"| {scheme} | {op} | {mode} | {m['overall']['accuracy']:.3f} | {m['all_nodes_correct']:.3f} | {m['equation_consistency']['all_satisfied']:.3f} | {m['overall']['format_errors']} | {m['overall']['incomplete']} | {values or 'n/a'} |"
                         )
     else:
         lines += [

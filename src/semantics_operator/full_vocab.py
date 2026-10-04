@@ -6,6 +6,7 @@ from enum import StrEnum
 import torch
 from torch.nn import functional as F
 
+from .positions import ReftPosition, intervention_positions
 from .reft import activation_intervention
 
 
@@ -29,14 +30,16 @@ def answer_sequences(lm, values):
     return result
 
 
-def teacher_forced_logits(lm, prompts, targets, *, site=None, transform=None):
+def teacher_forced_logits(
+    lm, prompts, targets, *, site=None, transform=None, position=ReftPosition.ANSWER
+):
     if not prompts or len(prompts) != len(targets) or any(not t for t in targets):
         raise ValueError("Provide one nonempty completion for every prompt")
     prefixes = [lm._prompt_ids(p) for p in prompts]
     sequences = [p + t[:-1] for p, t in zip(prefixes, targets, strict=True)]
     ids, mask = lm._batch(sequences)
     context = (
-        activation_intervention(lm, site, [len(p) - 1 for p in prefixes], transform)
+        activation_intervention(lm, site, intervention_positions(lm, prompts, position), transform)
         if site is not None and transform is not None
         else nullcontext()
     )

@@ -59,7 +59,7 @@ def run_intervention_diagnostics(
                 attach_candidate_agreement(generated, ranked)
                 tests[scheme.value][op.key][name] = {"candidates": ranked, "greedy": generated}
     return {
-        "experiment": "intervention_wording_diagnostics_v1",
+        "experiment": "intervention_wording_diagnostics_v2",
         "model": {"profile": cfg.profile, "device": str(lm.device)},
         "answer_protocol": protocol_metadata(lm),
         "max_new_tokens": max_new_tokens,
@@ -69,6 +69,7 @@ def run_intervention_diagnostics(
             "All modes use the same symbolic do-targets and the same default-wording test questions. Base predictions are evaluated against those counterfactual targets.",
             "replace_equation replaces only the intervened equations in the printed system; legacy_override retains the original equations and appends a force instruction.",
             "Complete digit plus stopping is required; invalid and incomplete responses remain in accuracy denominators. Protected damage is relative to correct baseline generations.",
+            "v2 counts all structurally unaffected nodes, including relay and bridge for lamp edits. Equation checks use predicted parents; they can pass for the wrong root inputs, so complete target accuracy is reported separately.",
         ],
     }
 
@@ -84,8 +85,8 @@ def save_intervention_diagnostics(root, report):
     lines = [
         "# Intervention wording audit",
         "",
-        "| Scheme | Operation | Mode | Greedy accuracy | Relay | Lamp | All nodes | New protected errors | Format errors | Incomplete |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Scheme | Operation | Mode | Greedy accuracy | Relay | Lamp | All nodes | Equations consistent | New protected errors | Format errors | Incomplete |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for scheme, ops in report["test"].items():
         for op, modes in ops.items():
@@ -94,7 +95,7 @@ def save_intervention_diagnostics(root, report):
                 lines.append(
                     f"| {scheme} | {op} | {name} | {m['overall']['accuracy']:.3f} | "
                     f"{m['by_node']['relay']['accuracy']:.3f} | {m['by_node']['lamp']['accuracy']:.3f} | "
-                    f"{m['all_nodes_correct']:.3f} | {m['protected_damage']['damaged']} | "
+                    f"{m['all_nodes_correct']:.3f} | {m['equation_consistency']['all_satisfied']:.3f} | {m['protected_damage']['damaged']} | "
                     f"{m['overall']['format_errors']} | {m['overall']['incomplete']} |"
                 )
     lines += ["", "## Limits", "", *["- " + x for x in report["limitations"]]]

@@ -1,11 +1,13 @@
 import json
 
+import pytest
 from test_model import tiny_model
 
 from semantics_operator.config import Settings
 
 
-def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
+@pytest.mark.parametrize("position", ["state", "answer"])
+def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path, position):
     from semantics_operator.cli import main
 
     lm = tiny_model()
@@ -21,6 +23,8 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
         main(
             [
                 "reft",
+                "--reft-position",
+                position,
                 "--config",
                 str(config),
                 "--env-file",
@@ -76,13 +80,17 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
         entry["alpha"] == 0 for choices in report["selected"].values() for entry in choices.values()
     )
     assert report["rollback"]["max_score_difference"] == 0
-    assert report["experiment"] == "loreft_causal_suite_v4"
+    assert report["experiment"] == "loreft_causal_suite_v5"
     assert report["answer_protocol"]["candidates"] == ["0", "1"]
-    assert report["site"]["boundary"] == "prompt"
+    assert report["site"]["position"] == position
+    assert report["prompt_layout"] == "state_first"
+    assert report["state_prefix_checks"]["train"]["identical_prefix_per_state"]
     assert report["site"]["prefix"] == []
     location = report["localization"]
     assert location["candidate_layers"] == [0, 1]
     assert location["selected_layer"] in (0, 1)
+    if position == "state":
+        assert location["selected_layer"] == 0
     for trial in location["trials"]:
         assert trial["self_patch_max_score_difference"] < 1e-5
         assert all(
@@ -96,6 +104,8 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
             assert modes["loreft_locality_selected"]["records"] == modes["base"]["records"]
             assert "incomplete" in modes["loreft_locality_fixed"]["overall"]
             assert "source" in modes["loreft_locality_fixed"]["protected_damage"]["by_node"]
+            assert "relay" in modes["loreft_locality_fixed"]["protected_damage"]["by_node"]
+            assert "equation_consistency" in modes["loreft_locality_fixed"]
     fixed = report["fixed_strength_diagnostics"]
     assert fixed["alpha"] == 1
     assert set(fixed["test"]) == set(report["test"])

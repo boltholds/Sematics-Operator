@@ -41,6 +41,12 @@ def main(argv=None) -> int:
         help="reft: training and validation mechanisms",
     )
     parser.add_argument(
+        "--reft-position",
+        choices=("state", "answer"),
+        default="state",
+        help="reft: edit the shared state before the question (default), or the answer position on identical prompts",
+    )
+    parser.add_argument(
         "--layers",
         nargs="+",
         help="MLP paths; compare block: indices/paths; reft: block candidates; das: one block (default 12)",
@@ -58,7 +64,7 @@ def main(argv=None) -> int:
         "--preservation-weight",
         type=float,
         default=0.0,
-        help="compare/reft validation penalty for new source/switch/flag errors",
+        help="Validation damage penalty: all unaffected nodes for reft; source/switch/flag for compare",
     )
     parser.add_argument(
         "--strengths", nargs="+", type=float, help="Validation steering grid; zero always included"
@@ -133,6 +139,7 @@ def main(argv=None) -> int:
                     progress=print,
                     loss_mode=args.loss_mode,
                     train_schemes=args.train_schemes,
+                    position=args.reft_position,
                 )
             else:
                 from .das_experiment import run_das

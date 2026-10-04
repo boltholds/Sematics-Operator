@@ -1,18 +1,33 @@
 """Unconstrained generation metrics for frozen-model causal interventions."""
 
 from .answer_protocol import parse_generation
+from .causal_metrics import equation_consistency, protected_damage
 from .causal_tasks import answer_metrics
+from .positions import ReftPosition
 from .reft import intervention_generate
 
 
 def generate_questions(
-    lm, samples, site, transform, *, sequence=(), max_new_tokens=16, progress=lambda _: None
+    lm,
+    samples,
+    site,
+    transform,
+    *,
+    sequence=(),
+    max_new_tokens=16,
+    progress=lambda _: None,
+    position=ReftPosition.ANSWER,
 ):
     outputs = []
     for i, q in enumerate(samples):
         prompt = q.prompt(sequence)
         generated = intervention_generate(
-            lm, [prompt], site, transform, max_new_tokens=max_new_tokens
+            lm,
+            [prompt],
+            site,
+            transform,
+            max_new_tokens=max_new_tokens,
+            position=position,
         )[0]
         outputs.append({"prompt": prompt, **parse_generation(generated)})
         if i == 0 or (i + 1) % 20 == 0 or i + 1 == len(samples):
@@ -51,22 +66,11 @@ def generation_metrics(outputs, samples, sequence, baseline):
         all(r["prediction"] == r["expected"] for r in rows if r["node"] in ("relay", "lamp"))
         for rows in groups.values()
     ) / len(groups)
-    by_node = {}
-    for node in ("source", "switch", "flag"):
-        rows = [
-            r for r in records if r["node"] == node and r["base_prediction"] == r["base_expected"]
-        ]
-        by_node[node] = {
-            "eligible": len(rows),
-            "damaged": sum(r["prediction"] != r["expected"] for r in rows),
-        }
-    eligible, damaged = (sum(x[k] for x in by_node.values()) for k in ("eligible", "damaged"))
-    result["protected_damage"] = {
-        "eligible": eligible,
-        "damaged": damaged,
-        "rate": damaged / eligible if eligible else 0.0,
-        "by_node": by_node,
-    }
+    predictions = [r["prediction"] for r in records]
+    result["protected_damage"] = protected_damage(
+        predictions, [r["base_prediction"] for r in records], samples, sequence
+    )
+    result["equation_consistency"] = equation_consistency(predictions, samples, sequence)
     return result
 
 

@@ -13,6 +13,7 @@ from torch.nn import functional as F
 
 from .answer_protocol import BARE_CANDIDATES
 from .localization import hidden
+from .positions import ReftPosition, intervention_positions
 
 
 class DAS(nn.Module):
@@ -84,21 +85,23 @@ def activation_intervention(lm, site, positions, transform):
         handle.remove()
 
 
-def intervention_scores(lm, prompts, site, prefix, transform):
-    """Bare candidates; edit the last prompt token before any answer token exists."""
+def intervention_scores(lm, prompts, site, prefix, transform, *, position=ReftPosition.ANSWER):
+    """Score bare candidates while editing the resolved state or answer position."""
     if prefix:
         raise ValueError("Bare digit interventions require an empty prefix")
-    positions = [len(lm._prompt_ids(p)) - 1 for p in prompts for _ in (0, 1)]
+    positions = [p for p in intervention_positions(lm, prompts, position) for _ in (0, 1)]
     with activation_intervention(lm, site, positions, transform):
         return lm.scores(prompts, candidates=BARE_CANDIDATES)
 
 
 @torch.no_grad()
-def intervention_generate(lm, prompts, site, transform, *, max_new_tokens=16):
+def intervention_generate(
+    lm, prompts, site, transform, *, max_new_tokens=16, position=ReftPosition.ANSWER
+):
     results = []
     for prompt in prompts:
-        position = len(lm._prompt_ids(prompt)) - 1
-        with activation_intervention(lm, site, [position], transform):
+        positions = intervention_positions(lm, [prompt], position)
+        with activation_intervention(lm, site, positions, transform):
             results.extend(lm.generate_greedy([prompt], max_new_tokens=max_new_tokens))
     return results
 

@@ -31,8 +31,13 @@ def hidden(output):
 
 
 @torch.no_grad()
-def capture_tail(lm, prompts, sites, window, prefix):
+def capture_tail(lm, prompts, sites, window, prefix, *, positions=None):
     sequences = [lm._prompt_ids(p) + prefix for p in prompts]
+    ends = [len(s) for s in sequences] if positions is None else [p + 1 for p in positions]
+    if len(ends) != len(sequences) or any(
+        not window <= end <= len(seq) for end, seq in zip(ends, sequences)
+    ):
+        raise ValueError("Capture positions must precede the answer and fit the token window")
     if window < 1 or min(map(len, sequences)) < window:
         raise ValueError("Token window exceeds available sequence")
     ids, mask = lm._batch(sequences)
@@ -44,8 +49,8 @@ def capture_tail(lm, prompts, sites, window, prefix):
                 tensor = hidden(output)
                 captures[site] = torch.stack(
                     [
-                        tensor[row, len(seq) - window : len(seq)].detach().float().cpu()
-                        for row, seq in enumerate(sequences)
+                        tensor[row, end - window : end].detach().float().cpu()
+                        for row, end in enumerate(ends)
                     ]
                 )
 
@@ -60,7 +65,7 @@ def capture_tail(lm, prompts, sites, window, prefix):
 
 
 @torch.no_grad()
-def capture_scoring_tail(lm, prompts, sites, window, *, candidates):
+def capture_scoring_tail(lm, prompts, sites, window, *, candidates, positions=None):
     """Capture prompt tails in the exact candidate-scoring forward layout.
 
     Returns [prompt, candidate, token, hidden] per site. The candidate axis
@@ -68,7 +73,12 @@ def capture_scoring_tail(lm, prompts, sites, window, *, candidates):
     every answer token. Reusing scores() keeps padding, row order and sequence
     lengths identical to the recipient's scoring pass for a self-patch.
     """
-    ends = [len(lm._prompt_ids(p)) for p in prompts for _ in candidates]
+    positions = [len(lm._prompt_ids(p)) - 1 for p in prompts] if positions is None else positions
+    if len(positions) != len(prompts) or any(
+        not window - 1 <= i < len(lm._prompt_ids(p)) for p, i in zip(prompts, positions)
+    ):
+        raise ValueError("Scoring capture positions must precede the answer")
+    ends = [pos + 1 for pos in positions for _ in candidates]
     if not ends or window < 1 or min(ends) < window:
         raise ValueError("Token window exceeds available sequence")
     captures, handles = {}, []
@@ -98,9 +108,28 @@ def capture_scoring_tail(lm, prompts, sites, window, *, candidates):
 
 @torch.no_grad()
 def patched_scores(
-    lm, prompts, donor, sites, window, prefix, *, replace=True, candidates=(" 0", " 1")
+    lm,
+    prompts,
+    donor,
+    sites,
+    window,
+    prefix,
+    *,
+    replace=True,
+    candidates=(" 0", " 1"),
+    positions=None,
 ):
-    ends = [len(lm._prompt_ids(p)) + len(prefix) for p in prompts for _ in (0, 1)]
+    positions = (
+        [len(lm._prompt_ids(p)) + len(prefix) - 1 for p in prompts]
+        if positions is None
+        else positions
+    )
+    if len(positions) != len(prompts) or any(
+        not window - 1 <= i < len(lm._prompt_ids(p)) + len(prefix)
+        for p, i in zip(prompts, positions)
+    ):
+        raise ValueError("Patch positions must precede the scored answer")
+    ends = [pos + 1 for pos in positions for _ in (0, 1)]
     handles = []
     try:
         for site in sites:

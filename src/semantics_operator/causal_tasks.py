@@ -5,6 +5,7 @@ from enum import StrEnum
 from itertools import product
 
 from .answer_protocol import ANSWER_INSTRUCTION
+from .positions import STATE_MARKER
 from .world import Intervention, Node
 
 
@@ -41,6 +42,11 @@ class PromptStyle(StrEnum):
     DEFAULT = "default"
     VERBAL = "verbal"
     QUERY_FIRST = "query_first"
+
+
+class PromptLayout(StrEnum):
+    LEGACY = "legacy"
+    STATE_FIRST = "state_first"
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,7 @@ class CircuitQuestion:
     node: CircuitNode
     split: str
     style: PromptStyle = PromptStyle.DEFAULT
+    layout: PromptLayout = PromptLayout.LEGACY
 
     @property
     def key(self):
@@ -152,6 +159,8 @@ class CircuitQuestion:
                 "test": "Report",
             }[self.split]
             text = f"{header} {self.node.value} for {w.name}. Equations: {rules}Inputs: {facts}"
+            if self.layout == PromptLayout.STATE_FIRST:
+                text = f"System {w.name}. Equations: {rules}Inputs: {facts}"
         if interventions:
             if mode == InterventionMode.LEGACY_OVERRIDE:
                 text += (
@@ -165,10 +174,14 @@ class CircuitQuestion:
                     + ", ".join(overrides)
                     + " were replaced; all other equations and inputs are unchanged. "
                 )
+        if self.layout == PromptLayout.STATE_FIRST:
+            text = text.rstrip() + STATE_MARKER + "\n"
         return text + f"What is {self.node.value}? " + ANSWER_INSTRUCTION + "\nAnswer:"
 
 
-def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFAULT,)):
+def circuit_questions(
+    split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFAULT,), layout=PromptLayout.LEGACY
+):
     if split not in ("train", "validation", "test"):
         raise ValueError("Unknown split")
     scheme = Scheme(scheme)
@@ -181,12 +194,16 @@ def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFA
     for i, values in enumerate(product((0, 1), repeat=3)):
         w = CircuitWorld(f"{split}_{scheme.value}_{i}", *values, scheme)
         result.extend(
-            CircuitQuestion(w, node, split, style) for style in styles for node in w.values()
+            CircuitQuestion(w, node, split, style, PromptLayout(layout))
+            for style in styles
+            for node in w.values()
         )
     return tuple(result)
 
 
-def training_questions(split, schemes=TRAIN_SCHEMES, *, styles=(PromptStyle.DEFAULT,)):
+def training_questions(
+    split, schemes=TRAIN_SCHEMES, *, styles=(PromptStyle.DEFAULT,), layout=PromptLayout.LEGACY
+):
     schemes = tuple(Scheme(s) for s in schemes)
     if (
         not schemes
@@ -196,7 +213,9 @@ def training_questions(split, schemes=TRAIN_SCHEMES, *, styles=(PromptStyle.DEFA
         raise ValueError(
             "Training schemes must be unique COPY/NOT mechanisms; other schemes are test-only"
         )
-    return tuple(q for s in schemes for q in circuit_questions(split, s, styles=styles))
+    return tuple(
+        q for s in schemes for q in circuit_questions(split, s, styles=styles, layout=layout)
+    )
 
 
 @dataclass(frozen=True)
@@ -226,7 +245,7 @@ def interchange_pairs(samples):
 
 
 def metrics(scores, samples, sequence, baseline):
-    from .conditional import protected_damage
+    from .causal_metrics import equation_consistency, protected_damage
     from .experiment import summarize
 
     result = summarize(scores, samples, sequence, baseline)
@@ -253,7 +272,11 @@ def metrics(scores, samples, sequence, baseline):
         )
     result["all_nodes_correct"] = sum(complete) / len(complete)
     result["relay_lamp_correct"] = sum(pair) / len(pair)
-    result["protected_damage"] = protected_damage(scores, samples, baseline)
+    predictions = scores.argmax(-1).tolist()
+    result["protected_damage"] = protected_damage(
+        predictions, baseline.argmax(-1).tolist(), samples, sequence
+    )
+    result["equation_consistency"] = equation_consistency(predictions, samples, sequence)
     return result
 
 
@@ -298,6 +321,7 @@ def answer_metrics(records):
 def selection(metrics, weight):
     return (
         metrics["all_nodes_correct"] - weight * metrics["protected_damage"]["rate"],
+        metrics["equation_consistency"]["all_satisfied"],
         metrics["relay_lamp_correct"],
         metrics["overall"]["accuracy"],
     )
