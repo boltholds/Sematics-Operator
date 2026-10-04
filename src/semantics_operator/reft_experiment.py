@@ -8,7 +8,7 @@ from uuid import uuid4
 import torch
 from safetensors.torch import save_file
 
-from .causal_tasks import Scheme, circuit_questions, metrics, selection
+from .causal_tasks import PromptStyle, Scheme, circuit_questions, metrics, selection
 from .conditional import fit_map, fit_pca_map, predict
 from .experiment import SCENARIOS, resolve_sequence
 from .localization import capture_tail, common_prefix, discover_sites
@@ -46,18 +46,28 @@ def evaluate(lm, samples, site, prefix, transform=lambda h: h, sequence=()):
 
 
 def train_batches(samples, op, steps, seed):
-    """One affected + one unaffected query; alternate changed/stable affected pools."""
+    """Complete world/style batches; alternate worlds changed and unchanged by do(op)."""
     rng = random.Random(seed)
-    affected = [i for i, q in enumerate(samples) if q.node in q.world.affected(op)]
-    local = [i for i in range(len(samples)) if i not in affected]
-    changed = [i for i in affected if samples[i].answer((op,)) != samples[i].answer()]
-    stable = [i for i in affected if i not in changed]
-    pools = [changed or affected, stable or affected, local]
+    groups = {}
+    for i, q in enumerate(samples):
+        groups.setdefault(q.state_key, []).append(i)
+    if not groups:
+        raise ValueError("Training requires complete states")
+    for indices in groups.values():
+        if {samples[i].node for i in indices} != set(samples[indices[0]].world.values()):
+            raise ValueError("Training requires every question role for each state/style")
+    changed, stable = [], []
+    for indices in groups.values():
+        pool = (
+            changed
+            if any(samples[i].answer((op,)) != samples[i].answer() for i in indices)
+            else stable
+        )
+        pool.append(tuple(indices))
+    pools = [changed or stable.copy(), stable or changed.copy()]
     for pool in pools:
         rng.shuffle(pool)
-    return [
-        (pools[t % 2][(t // 2) % len(pools[t % 2])], local[t % len(local)]) for t in range(steps)
-    ]
+    return [pools[t % 2][(t // 2) % len(pools[t % 2])] for t in range(steps)]
 
 
 def train_loreft(lm, cfg, samples, baseline, site, prefix, op, hidden_size, locality, progress):
@@ -68,22 +78,60 @@ def train_loreft(lm, cfg, samples, baseline, site, prefix, op, hidden_size, loca
     for step, indices in enumerate(batches):
         batch = [samples[i] for i in indices]
         optimizer.zero_grad(set_to_none=True)
-        scores = intervention_scores(lm, [q.prompt() for q in batch], site, prefix, model)
-        labels = torch.tensor([q.answer((op,)) for q in batch], device=lm.device)
-        affected = torch.tensor([q.node in q.world.affected(op) for q in batch], device=lm.device)
-        loss, parts = task_locality_loss(
-            scores, baseline[list(indices)], labels, affected, locality
-        )
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Non-finite LoReFT loss")
-        loss.backward()
+        n_task = sum(q.node in q.world.affected(op) for q in batch)
+        counts = n_task, len(batch) - n_task
+        parts, by_node = {"task_ce": 0.0, "locality_kl": 0.0}, {}
+        total = 0.0
+        # Accumulate the exact full-state mean CE + mean KL, without retaining all graphs.
+        for start in range(0, len(batch), 2):
+            micro = batch[start : start + 2]
+            scores = intervention_scores(lm, [q.prompt() for q in micro], site, prefix, model)
+            labels = torch.tensor([q.answer((op,)) for q in micro], device=lm.device)
+            affected = torch.tensor(
+                [q.node in q.world.affected(op) for q in micro], device=lm.device
+            )
+            original = baseline[list(indices[start : start + 2])]
+            loss, chunk_parts = task_locality_loss(
+                scores,
+                original,
+                labels,
+                affected,
+                locality,
+                normalization_counts=counts,
+            )
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite LoReFT loss")
+            loss.backward()
+            total += float(loss.detach())
+            for key, value in chunk_parts.items():
+                parts[key] += value
+            with torch.no_grad():
+                logp = scores.detach().float().log_softmax(-1).cpu()
+                original_logp = original.float().log_softmax(-1).cpu()
+                kl = (original_logp.exp() * (original_logp - logp)).sum(-1)
+                for row, q in enumerate(micro):
+                    is_affected = q.node in q.world.affected(op)
+                    eligible = not is_affected and int(original[row].argmax()) == q.answer()
+                    by_node[q.node.value] = {
+                        "count": 1,
+                        "affected": is_affected,
+                        "target_ce": float(-logp[row, q.answer((op,))]),
+                        "locality_kl": None if is_affected else float(kl[row]),
+                        "protected_eligible": int(eligible),
+                        "protected_damaged": int(
+                            eligible and int(logp[row].argmax()) != q.answer()
+                        ),
+                    }
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
         optimizer.step()
-        losses.append({"step": step + 1, "loss": float(loss.detach()), **parts})
+        losses.append({"step": step + 1, "loss": total, **parts, "by_node": by_node})
         if step == 0 or (step + 1) % 10 == 0:
             progress(f"LoReFT {op.key} locality={locality}: {step + 1}/{cfg.steps} {parts}")
     return model.eval(), {
         "locality_weight": locality,
+        "batching": "full_state",
+        "microbatch_size": 2,
+        "styles": list(dict.fromkeys(q.style.value for q in samples)),
         "losses": losses,
         "question_keys": [[samples[i].key for i in b] for b in batches],
         "unique_questions": len({i for b in batches for i in b}),
@@ -110,7 +158,8 @@ def run_reft_suite(
     if any(type(k) is not int or k < 1 for k in pca_components):
         raise ValueError("PCA ranks must be positive integers")
     site, prefix = block_site(lm, layer), common_prefix(lm)
-    train, val = circuit_questions("train"), circuit_questions("validation")
+    train = circuit_questions("train", styles=tuple(PromptStyle))
+    val = circuit_questions("validation")
     methods = (
         "constant",
         "ridge",
@@ -164,16 +213,28 @@ def run_reft_suite(
                         "all_nodes_correct": m["all_nodes_correct"],
                         "relay_lamp_correct": m["relay_lamp_correct"],
                         "protected_damage": m["protected_damage"],
+                        **{k: m[k] for k in ("overall", "changed", "by_node", "by_label")},
                     }
                     trials[op.key][method].append(entry)
                     best = selected[op.key].get(method)
                     if best is None or entry["objective"] > best["objective"]:
                         selected[op.key][method] = entry
+        progress("Fixed alpha=1 LoReFT diagnostics: train and validation")
+        fixed = {
+            "alpha": 1.0,
+            "used_for_selection": False,
+            "train": fixed_loreft_metrics(lm, train, base_train, site, prefix, fitted),
+            "validation": fixed_loreft_metrics(lm, val, base_val, site, prefix, fitted),
+            "test": {},
+        }
         tests, exact = {}, {}
         for scheme in Scheme:
             progress(f"Held-out evaluation: {scheme.value}")
             samples = circuit_questions("test", scheme)
             base = evaluate(lm, samples, site, prefix)
+            fixed["test"][scheme.value] = fixed_loreft_metrics(
+                lm, samples, base, site, prefix, fitted
+            )
             tests[scheme.value], exact[scheme.value] = {}, {}
             for name, sequence in SCENARIOS.items():
                 modes = {
@@ -217,7 +278,7 @@ def run_reft_suite(
         if not torch.allclose(restored, base_train, atol=1e-5, rtol=1e-5):
             raise RuntimeError("LoReFT rollback failed")
     return {
-        "experiment": "loreft_causal_suite_v1",
+        "experiment": "loreft_causal_suite_v2",
         "model": {"profile": cfg.profile, "device": str(lm.device)},
         "seed": cfg.seed,
         "rank": cfg.rank,
@@ -235,10 +296,12 @@ def run_reft_suite(
         },
         "methods": list(methods),
         "training": training,
+        "train_styles": [style.value for style in PromptStyle],
         "selected": selected,
         "validation_trials": trials,
         "test": tests,
         "oracle_diagnostics": exact,
+        "fixed_strength_diagnostics": fixed,
         "rollback": {"max_score_difference": difference},
         "sources": ["https://arxiv.org/abs/2404.03592", "https://arxiv.org/abs/2110.11309"],
         "limitations": [
@@ -246,6 +309,9 @@ def run_reft_suite(
             "CE and forward locality KL use normalized scores for only 0/1 candidates, not the full vocabulary distribution.",
             "Task labels supervise affected variables; locality preserves every unaffected query, including relay for lamp edits. Symbolic masks are used only in training.",
             "Locality is a soft training objective, not a guarantee. loreft_task is an identically initialized zero-locality ablation.",
+            "Each optimizer step contains every role for one world and wording style, with microbatch accumulation. Changed/stable worlds alternate. The three training styles change the data and compute budget relative to v1.",
+            "Training by-node losses are measured before each update on the scheduled batch; fixed-alpha train metrics evaluate the final operator on every training question.",
+            "Fixed-alpha=1 diagnostics cover primitive operations on train, validation and test, independently of validation selection; they are not used to choose operators. Compositions in test use selected strengths only.",
             "Donor-regression baselines have different supervision from LoReFT; they share train worlds, site and validation alpha grid.",
             "Compositions sequentially transform the same hidden vector; they do not rerun the network between primitive operators.",
             "Revision uses external latest-write-wins resolution, not learned contradiction detection.",
@@ -254,6 +320,19 @@ def run_reft_suite(
             "Exact donors are privileged controls and do not participate in fitting or selection. Base model weights remain frozen.",
         ],
     }, tensors
+
+
+def fixed_loreft_metrics(lm, samples, base, site, prefix, fitted):
+    """Predeclared unit-strength diagnostics; no donor and no selection side effects."""
+    result = {}
+    for op in OPERATORS:
+        result[op.key] = {"base": metrics(base, samples, (op,), base)}
+        for method in ("loreft_task", "loreft_locality"):
+            scores = evaluate(
+                lm, samples, site, prefix, make_transform(fitted[op.key][method], method, 1.0)
+            )
+            result[op.key][method] = metrics(scores, samples, (op,), base)
+    return result
 
 
 def make_transform(model, method, alpha):
@@ -303,6 +382,33 @@ def save_research(root, report, tensors):
             json.dumps(report["selected"], indent=2),
             "```",
         ]
+        if "fixed_strength_diagnostics" in report:
+            fixed = report["fixed_strength_diagnostics"]
+            lines += [
+                "",
+                "## Fixed alpha=1 diagnostics (not used for selection)",
+                "",
+                "| Split / scheme | Operation | Method | Accuracy | Changed | All nodes | Source / switch / flag damage |",
+                "|---|---|---|---:|---:|---:|---|",
+            ]
+            groups = {
+                "train": fixed["train"],
+                "validation": fixed["validation"],
+                **{"test/" + s: value for s, value in fixed["test"].items()},
+            }
+            for split, operations in groups.items():
+                for op, methods in operations.items():
+                    for method, m in methods.items():
+                        damage = m["protected_damage"]["by_node"]
+                        values = " / ".join(
+                            f"{damage[n]['damaged']}/{damage[n]['eligible']}"
+                            for n in ("source", "switch", "flag")
+                        )
+                        changed = m["changed"]["accuracy"]
+                        changed_text = "n/a" if changed is None else f"{changed:.3f}"
+                        lines.append(
+                            f"| {split} | {op} | {method} | {m['overall']['accuracy']:.3f} | {changed_text} | {m['all_nodes_correct']:.3f} | {values} |"
+                        )
     else:
         lines += [
             "| Scheme | Variable | Method | IIA | Changed cases | Protected damage |",

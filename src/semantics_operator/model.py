@@ -111,7 +111,7 @@ class LocalLanguageModel:
             mask[row, : len(seq)] = 1
         return ids, mask
 
-    def scores(self, prompts: list[str]) -> Tensor:
+    def scores(self, prompts: list[str], *, candidates=(" 0", " 1")) -> Tensor:
         """Sum token log-probabilities of continuations ' 0' and ' 1', not sampling.
 
         Prompt and continuations are tokenized separately to make the conditional
@@ -120,11 +120,13 @@ class LocalLanguageModel:
         """
         if not prompts:
             raise ValueError("At least one prompt is required")
+        if len(candidates) != 2 or any(not isinstance(c, str) or not c for c in candidates):
+            raise ValueError("Exactly two nonempty candidate strings are required")
         sequences, rows, positions, targets, owners = [], [], [], [], []
         for prompt in prompts:
             prefix = self._prompt_ids(prompt)
-            for value in (0, 1):
-                suffix = self.tokenizer.encode(f" {value}", add_special_tokens=False)
+            for candidate in candidates:
+                suffix = self.tokenizer.encode(candidate, add_special_tokens=False)
                 if not suffix:
                     raise ValueError("Empty candidate tokenization")
                 row = len(sequences)
@@ -142,6 +144,52 @@ class LocalLanguageModel:
         scores = torch.zeros(len(sequences), device=self.device)
         scores = scores.index_add(0, torch.tensor(owners, device=self.device), logp)
         return scores.reshape(len(prompts), 2)
+
+    @torch.no_grad()
+    def generate_greedy(self, prompts: list[str], *, max_new_tokens=16) -> list[dict]:
+        """Unconstrained argmax decoding, one prompt at a time, without a forced space.
+
+        Uses the same forward/chat formatting as scoring and no KV cache, including
+        hybrid GGUF models. This intentionally does not apply HF logits processors.
+        """
+        if not prompts or type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("Provide prompts and a positive max_new_tokens")
+        prefixes = [self._prompt_ids(p) for p in prompts]
+        if any(len(p) + max_new_tokens > self.max_length for p in prefixes):
+            raise ValueError(
+                "Prompt plus max_new_tokens exceeds max_length; increase it explicitly"
+            )
+        eos = None
+        for config in (
+            getattr(self.model, "generation_config", None),
+            self.model.config,
+            self.tokenizer,
+        ):
+            eos = getattr(config, "eos_token_id", None)
+            if eos is not None:
+                break
+        stop_ids = set(eos if isinstance(eos, (list, tuple)) else [] if eos is None else [eos])
+        results = []
+        for prefix in prefixes:
+            generated, reason = [], "max_new_tokens"
+            for _ in range(max_new_tokens):
+                ids, mask = self._batch([prefix + generated])
+                logits = self.model(input_ids=ids, attention_mask=mask, use_cache=False).logits
+                if not torch.isfinite(logits[0, -1]).all():
+                    raise FloatingPointError("Non-finite generation logits")
+                token = int(logits[0, -1].argmax())
+                generated.append(token)
+                if token in stop_ids:
+                    reason = "eos"
+                    break
+            results.append(
+                {
+                    "text": self.tokenizer.decode(generated, skip_special_tokens=True),
+                    "token_ids": generated,
+                    "stop_reason": reason,
+                }
+            )
+        return results
 
     @torch.no_grad()
     def representations(self, prompts: list[str], target: str) -> Tensor:

@@ -81,18 +81,32 @@ def intervention_scores(lm, prompts, site, prefix, transform):
         handle.remove()
 
 
-def task_locality_loss(scores, baseline, labels, affected, locality_weight):
+def task_locality_loss(
+    scores,
+    baseline,
+    labels,
+    affected,
+    locality_weight,
+    *,
+    normalization_counts=None,
+):
     """CE on affected nodes + forward KL on unaffected nodes; binary candidates only."""
     logp = scores.float().log_softmax(-1)
     labels, affected = labels.to(scores.device), affected.to(scores.device)
+    task_count, local_count = normalization_counts or (int(affected.sum()), int((~affected).sum()))
     zero = scores.sum() * 0
-    task = F.nll_loss(logp[affected], labels[affected]) if affected.any() else zero
+    task = (
+        F.nll_loss(logp[affected], labels[affected], reduction="sum") / task_count
+        if affected.any()
+        else zero
+    )
     locality = (
         F.kl_div(
             logp[~affected],
             baseline.detach().to(scores).softmax(-1)[~affected],
-            reduction="batchmean",
+            reduction="sum",
         )
+        / local_count
         if (~affected).any()
         else zero
     )

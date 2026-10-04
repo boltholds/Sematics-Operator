@@ -9,7 +9,8 @@ from .config import load_settings
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Reversible weight-space semantic experiments")
     parser.add_argument(
-        "command", choices=("inspect", "run", "steer", "compare", "localize", "reft", "das")
+        "command",
+        choices=("inspect", "run", "steer", "compare", "localize", "reft", "das", "diagnose"),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -18,6 +19,9 @@ def main(argv=None) -> int:
     parser.add_argument("--rank", type=int, help="Low-rank dimension for run/reft/das")
     parser.add_argument("--learning-rate", type=float, help="Training learning rate")
     parser.add_argument("--locality-weight", type=float, help="Training locality loss weight")
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=16, help="Greedy token budget for diagnose"
+    )
     parser.add_argument(
         "--layers",
         nargs="+",
@@ -75,6 +79,12 @@ def main(argv=None) -> int:
         from .model import LocalLanguageModel
 
         lm = LocalLanguageModel.load(cfg)
+        if args.command == "diagnose":
+            from .diagnostics import run_diagnostics, save_diagnostics
+
+            report = run_diagnostics(lm, cfg, max_new_tokens=args.max_new_tokens, progress=print)
+            print(f"Results: {save_diagnostics(cfg.output_dir, report)}")
+            return 0
         if args.command in ("reft", "das"):
             from .reft_experiment import run_reft_suite, save_research
 

@@ -53,6 +53,23 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
         entry["alpha"] == 0 for choices in report["selected"].values() for entry in choices.values()
     )
     assert report["rollback"]["max_score_difference"] == 0
+    assert report["experiment"] == "loreft_causal_suite_v2"
+    fixed = report["fixed_strength_diagnostics"]
+    assert fixed["alpha"] == 1
+    assert set(fixed["test"]) == set(report["test"])
+    for split in (fixed["train"], fixed["validation"], *fixed["test"].values()):
+        assert set(split) == {"relay_0", "relay_1", "lamp_1"}
+        for methods in split.values():
+            assert set(methods) == {"base", "loreft_task", "loreft_locality"}
+            assert "by_label" in methods["loreft_locality"]
+    assert any(
+        methods["loreft_locality"]["records"] != methods["base"]["records"]
+        for methods in fixed["validation"].values()
+    )
+    for method in report["training"]["relay_0"].values():
+        assert method["batching"] == "full_state"
+        assert all(len(batch) == 5 for batch in method["question_keys"])
+        assert set(method["losses"][0]["by_node"]) == {"source", "switch", "relay", "lamp", "flag"}
     for scenarios in report["test"].values():
         assert "composition" in scenarios and "composition_reversed" in scenarios
         for methods in scenarios.values():

@@ -23,6 +23,12 @@ class CircuitNode(StrEnum):
     FLAG = "flag"
 
 
+class PromptStyle(StrEnum):
+    DEFAULT = "default"
+    VERBAL = "verbal"
+    QUERY_FIRST = "query_first"
+
+
 @dataclass(frozen=True)
 class CircuitWorld:
     name: str
@@ -65,10 +71,16 @@ class CircuitQuestion:
     world: CircuitWorld
     node: CircuitNode
     split: str
+    style: PromptStyle = PromptStyle.DEFAULT
 
     @property
     def key(self):
-        return f"{self.world.name}/{self.node.value}"
+        style = "" if self.style == PromptStyle.DEFAULT else f"/{self.style.value}"
+        return f"{self.world.name}{style}/{self.node.value}"
+
+    @property
+    def state_key(self):
+        return self.world.name, self.style
 
     def answer(self, interventions=()):
         return self.world.values(interventions)[self.node]
@@ -90,6 +102,23 @@ class CircuitQuestion:
             text = f"Evaluate circuit {w.name}. Rules: {rules}Given inputs: {facts}"
         else:
             text = f"Consider device {w.name}. Its equations are: {rules}Input settings: {facts}"
+        if self.style == PromptStyle.VERBAL:
+            header = {
+                "train": "Recorded circuit",
+                "validation": "Evaluate this recorded system",
+                "test": "Inspect the following device",
+            }[self.split]
+            text = (
+                f"{header} {w.name}. The source has value {w.source}, the switch has value "
+                f"{w.switch}, and the flag has value {w.flag}. The equations are: {rules}"
+            )
+        elif self.style == PromptStyle.QUERY_FIRST:
+            header = {
+                "train": "Find",
+                "validation": "Determine",
+                "test": "Report",
+            }[self.split]
+            text = f"{header} {self.node.value} for {w.name}. Equations: {rules}Inputs: {facts}"
         if interventions:
             overrides = {op.node: op.value for op in interventions}
             text += (
@@ -97,18 +126,29 @@ class CircuitQuestion:
                 + "; ".join(f"force {n.value}={v}" for n, v in overrides.items())
                 + ". "
             )
-        return text + f"What is {self.node.value}? Answer with only 0 or 1.\nAnswer:"
+        question = {
+            "train": f"Give the value of {self.node.value} as 0 or 1.",
+            "validation": f"Return only the binary value of {self.node.value}.",
+            "test": f"Which value, 0 or 1, does {self.node.value} have? Reply with one digit.",
+        }[self.split]
+        if self.style == PromptStyle.DEFAULT:
+            question = f"What is {self.node.value}? Answer with only 0 or 1."
+        return text + question + "\nAnswer:"
 
 
-def circuit_questions(split, scheme=Scheme.AND_COPY):
+def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFAULT,)):
     if split not in ("train", "validation", "test"):
         raise ValueError("Unknown split")
     if split != "test" and scheme != Scheme.AND_COPY:
         raise ValueError("Shifted schemes are test-only")
+    if not styles or len(set(styles)) != len(styles) or any(s not in PromptStyle for s in styles):
+        raise ValueError("Provide unique prompt styles")
     result = []
     for i, values in enumerate(product((0, 1), repeat=3)):
         w = CircuitWorld(f"{split}_{scheme.value}_{i}", *values, scheme)
-        result.extend(CircuitQuestion(w, node, split) for node in w.values())
+        result.extend(
+            CircuitQuestion(w, node, split, style) for style in styles for node in w.values()
+        )
     return tuple(result)
 
 
@@ -143,6 +183,11 @@ def metrics(scores, samples, sequence, baseline):
     from .experiment import summarize
 
     result = summarize(scores, samples, sequence, baseline)
+    for record, q in zip(result["records"], samples, strict=True):
+        record["style"] = q.style.value
+    breakdown = answer_metrics(result["records"])
+    for field in ("by_label", "by_style", "by_node_label", "prediction_counts"):
+        result[field] = breakdown[field]
     result["by_node"] = {}
     for node in dict.fromkeys(q.node.value for q in samples):
         records = [r for r in result["records"] if r["node"] == node]
@@ -152,7 +197,7 @@ def metrics(scores, samples, sequence, baseline):
         }
     groups = {}
     for q, pred in zip(samples, scores.argmax(-1).tolist(), strict=True):
-        groups.setdefault(q.world.name, []).append((q, pred))
+        groups.setdefault(q.state_key, []).append((q, pred))
     complete, pair = [], []
     for group in groups.values():
         complete.append(all(pred == q.answer(sequence) for q, pred in group))
@@ -163,6 +208,42 @@ def metrics(scores, samples, sequence, baseline):
     result["relay_lamp_correct"] = sum(pair) / len(pair)
     result["protected_damage"] = protected_damage(scores, samples, baseline)
     return result
+
+
+def answer_metrics(records):
+    """Invalid/missing generated digits count as errors, never disappear from denominators."""
+
+    def group(rows):
+        correct = sum(r["prediction"] == r["expected"] for r in rows)
+        return {
+            "count": len(rows),
+            "accuracy": correct / len(rows) if rows else None,
+            "errors": len(rows) - correct,
+            "invalid": sum(r["prediction"] is None for r in rows),
+        }
+
+    nodes = dict.fromkeys(r["node"] for r in records)
+    return {
+        "overall": group(records),
+        "by_label": {str(v): group([r for r in records if r["expected"] == v]) for v in (0, 1)},
+        "by_node": {n: group([r for r in records if r["node"] == n]) for n in nodes},
+        "by_node_label": {
+            n: {
+                str(v): group([r for r in records if r["node"] == n and r["expected"] == v])
+                for v in (0, 1)
+            }
+            for n in nodes
+        },
+        "by_style": {
+            s: group([r for r in records if r["style"] == s])
+            for s in dict.fromkeys(r["style"] for r in records)
+        },
+        "prediction_counts": {
+            str(v) if v is not None else "invalid": sum(r["prediction"] == v for r in records)
+            for v in (0, 1, None)
+        },
+        "records": records,
+    }
 
 
 def selection(metrics, weight):

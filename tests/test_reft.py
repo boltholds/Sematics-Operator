@@ -68,6 +68,61 @@ def test_loreft_and_das_match_formulas_and_preserve_complement():
         LoReFT(6, 7)
 
 
+def test_full_state_batches_cover_roles_and_train_styles_without_changing_targets():
+    from semantics_operator.causal_tasks import PromptStyle, circuit_questions, metrics
+    from semantics_operator.reft_experiment import train_batches
+    from semantics_operator.world import OPERATORS
+
+    samples = circuit_questions("train", styles=tuple(PromptStyle))
+    assert len(samples) == len({q.key for q in samples}) == 120
+    assert len({q.prompt() for q in samples}) == 120
+    for op in OPERATORS:
+        batches = train_batches(samples, op, 80, 42)
+        assert batches == train_batches(samples, op, 80, 42)
+        assert {i for batch in batches for i in batch} == set(range(120))
+        for step, indices in enumerate(batches):
+            batch = [samples[i] for i in indices]
+            assert len(batch) == 5
+            assert len({(q.world.name, q.style) for q in batch}) == 1
+            assert {q.node.value for q in batch} == {"source", "switch", "relay", "lamp", "flag"}
+            assert any(q.answer((op,)) != q.answer() for q in batch) == (step % 2 == 0)
+    scores = torch.tensor([[1 - q.answer(), q.answer()] for q in samples]).float()
+    report = metrics(scores, samples, (), scores)
+    assert report["all_nodes_correct"] == 1
+    assert set(report["by_style"]) == {s.value for s in PromptStyle}
+    assert report["by_label"]["0"]["accuracy"] == 1
+    # One failed style/world must not mark all three descriptions as failed.
+    scores[0] = scores[0].flip(0)
+    assert metrics(scores, samples, (), scores)["all_nodes_correct"] == 23 / 24
+
+
+def test_microbatch_locality_gradient_matches_full_state_objective():
+    from semantics_operator.reft import task_locality_loss
+
+    baseline = torch.randn(5, 2)
+    labels = torch.tensor([0, 1, 0, 0, 1])
+    affected = torch.tensor([False, False, True, True, False])
+    full = torch.randn(5, 2, requires_grad=True)
+    micro = full.detach().clone().requires_grad_()
+    expected, _ = task_locality_loss(full, baseline, labels, affected, 1.7)
+    expected.backward()
+    total = 0
+    for start in range(0, 5, 2):
+        sl = slice(start, start + 2)
+        loss, _ = task_locality_loss(
+            micro[sl],
+            baseline[sl],
+            labels[sl],
+            affected[sl],
+            1.7,
+            normalization_counts=(2, 3),
+        )
+        total += float(loss.detach())
+        loss.backward()
+    assert total == pytest.approx(float(expected.detach()), abs=1e-6)
+    torch.testing.assert_close(micro.grad, full.grad)
+
+
 def test_locality_loss_backpropagates_through_frozen_block_and_removes_hook():
     from semantics_operator.reft import (
         LoReFT,
