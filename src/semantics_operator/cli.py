@@ -20,11 +20,30 @@ def main(argv=None) -> int:
             "das",
             "diagnose",
             "transfer",
+            "heatmap",
         ),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default="", help="Named model profile in TOML")
+    parser.add_argument(
+        "--pair",
+        nargs=2,
+        action="append",
+        metavar=("A", "B"),
+        help="heatmap: word/value pair; repeat for multiple pairs (default: холодно жарко)",
+    )
+    parser.add_argument(
+        "--template",
+        default="Слово: {word}.\nЗначение:",
+        help="heatmap: identical context with exactly one {word} placeholder",
+    )
+    parser.add_argument(
+        "--prompt-format",
+        choices=("raw", "chat"),
+        default="raw",
+        help="heatmap: raw text (default) or the model's chat template",
+    )
     parser.add_argument("--steps", type=int, help="Override steps per primitive operator")
     parser.add_argument("--rank", type=int, help="Low-rank dimension for run/reft/das/transfer")
     parser.add_argument("--learning-rate", type=float, help="Training learning rate")
@@ -71,7 +90,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--layers",
         nargs="+",
-        help="MLP paths; compare: indices/paths; reft: candidate blocks; das: one block (default 12); transfer: one fixed block (default 8)",
+        help="MLP paths; compare: indices/paths; reft: candidate blocks; das: one block (default 12); transfer: one fixed block (default 8); heatmap: block indices (default all)",
     )
     parser.add_argument(
         "--site-kind", choices=("mlp", "block"), default="mlp", help="compare injection site"
@@ -130,6 +149,21 @@ def main(argv=None) -> int:
         if args.command == "transfer" and args.layers and len(args.layers) != 1:
             raise ValueError("transfer requires one predeclared block, e.g. --layers 8")
         lm = LocalLanguageModel.load(cfg)
+        if args.command == "heatmap":
+            from .heatmap_reporting import run_heatmaps
+
+            folder = run_heatmaps(
+                lm,
+                cfg,
+                pairs=args.pair,
+                template=args.template,
+                prompt_format=args.prompt_format,
+                layers=[int(i) for i in args.layers] if args.layers else None,
+                progress=print,
+            )
+            print(f"Results: {folder}")
+            print(f"Open: {folder / 'index.html'}")
+            return 0
         if args.command == "transfer":
             from .transfer_experiment import run_transfer
             from .transfer_reporting import save_transfer
