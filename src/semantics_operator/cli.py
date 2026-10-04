@@ -21,6 +21,7 @@ def main(argv=None) -> int:
             "diagnose",
             "transfer",
             "heatmap",
+            "word-transfer",
         ),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
@@ -61,7 +62,7 @@ def main(argv=None) -> int:
         "--max-new-tokens",
         type=int,
         default=16,
-        help="Greedy token budget for diagnose/reft/transfer",
+        help="Greedy token budget for diagnose/reft/transfer/word-transfer",
     )
     parser.add_argument(
         "--intervention-audit",
@@ -90,7 +91,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--layers",
         nargs="+",
-        help="MLP paths; compare: indices/paths; reft: candidate blocks; das: one block (default 12); transfer: one fixed block (default 8); heatmap: block indices (default all)",
+        help="MLP paths; compare: indices/paths; reft: candidate blocks; das: one block (default 12); transfer: one fixed block (default 8); heatmap: block indices (default all); word-transfer: one fixed block (default 13)",
     )
     parser.add_argument(
         "--site-kind", choices=("mlp", "block"), default="mlp", help="compare injection site"
@@ -108,7 +109,10 @@ def main(argv=None) -> int:
         help="Validation damage penalty (transfer default 1, others 0): all unaffected nodes for reft/transfer; source/switch/flag for compare",
     )
     parser.add_argument(
-        "--strengths", nargs="+", type=float, help="Validation steering grid; zero always included"
+        "--strengths",
+        nargs="+",
+        type=float,
+        help="Validation steering grid; word-transfer: predeclared nonnegative sweep, alpha=1 always primary; zero always included",
     )
     parser.add_argument(
         "--ridge", type=float, default=0.1, help="Positive regularization for compare"
@@ -148,7 +152,34 @@ def main(argv=None) -> int:
 
         if args.command == "transfer" and args.layers and len(args.layers) != 1:
             raise ValueError("transfer requires one predeclared block, e.g. --layers 8")
+        if args.command == "word-transfer":
+            if args.layers and len(args.layers) != 1:
+                raise ValueError("word-transfer requires one predeclared block, e.g. --layers 13")
+            if (
+                args.pair
+                or args.template != "Слово: {word}.\nЗначение:"
+                or args.prompt_format != "raw"
+            ):
+                raise ValueError(
+                    "word-transfer uses fixed RU/EN temperature pairs and the raw heatmap template"
+                )
         lm = LocalLanguageModel.load(cfg)
+        if args.command == "word-transfer":
+            from .word_transfer import run_word_transfer
+            from .word_transfer_reporting import save_word_transfer
+
+            report, tensors = run_word_transfer(
+                lm,
+                cfg,
+                layer=int(args.layers[0]) if args.layers else 13,
+                strengths=args.strengths,
+                max_new_tokens=args.max_new_tokens,
+                progress=print,
+            )
+            folder = save_word_transfer(cfg.output_dir, report, tensors)
+            print(f"Results: {folder}")
+            print(f"Open: {folder / 'index.html'}")
+            return 0
         if args.command == "heatmap":
             from .heatmap_reporting import run_heatmaps
 
