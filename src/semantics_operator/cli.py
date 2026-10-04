@@ -22,9 +22,16 @@ def main(argv=None) -> int:
             "transfer",
             "heatmap",
             "word-transfer",
+            "executor",
         ),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
+    parser.add_argument("--executor-config", type=Path, default=Path("configs/executor.toml"))
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        help="executor: override device without loading an LLM",
+    )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default="", help="Named model profile in TOML")
     parser.add_argument(
@@ -141,6 +148,25 @@ def main(argv=None) -> int:
     if preservation_weight is None:
         preservation_weight = 1.0 if args.command == "transfer" else 0.0
     try:
+        if args.command == "executor":
+            from .executor_config import load_executor_config
+            from .executor_experiment import run_executor
+            from .executor_reporting import save_executor
+
+            executor_cfg = load_executor_config(
+                args.executor_config,
+                args.env_file,
+                steps=args.steps,
+                learning_rate=args.learning_rate,
+                device=args.device,
+                seeds=(args.seed,) if args.seed is not None else None,
+                preservation_weight=args.preservation_weight,
+            )
+            report, weights = run_executor(executor_cfg)
+            folder = save_executor(executor_cfg.output_dir, report, weights)
+            print(f"Results: {folder}")
+            print(f"Open: {folder / 'index.html'}")
+            return 0
         cfg = load_settings(args.config, args.env_file, args.model)
         if args.steps is not None:
             cfg = replace(cfg, steps=args.steps)

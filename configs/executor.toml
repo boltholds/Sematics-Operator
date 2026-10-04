@@ -1,0 +1,17 @@
+# Independent of LFM / GGUF / SO_MODEL. Paths are relative to this TOML.
+[executor]
+steps = 300
+width = 64
+heads = 4
+blocks = 2
+batch_size = 32
+train_graphs = 64
+eval_graphs = 16
+seeds = [42, 43, 44]
+dataset_seed = 20261004
+learning_rate = 0.003
+preservation_weight = 1.0
+validation_every = 25
+threads = 2
+device = "cpu"
+output_dir = "../runs"
