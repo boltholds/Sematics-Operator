@@ -24,8 +24,11 @@ def test_inversion_xor_counterfactuals_and_uniform_answer_instruction():
             elif q.node.value in ("source", "switch", "flag"):
                 assert all(q.answer((op,)) == q.answer() for op in OPERATORS)
         for split in ("train", "validation"):
-            with pytest.raises(ValueError, match="test-only"):
-                circuit_questions(split, scheme)
+            if scheme == Scheme.AND_XOR:
+                with pytest.raises(ValueError, match="test-only"):
+                    circuit_questions(split, scheme)
+            else:
+                assert len(circuit_questions(split, scheme)) == 40
     for split in ("train", "validation", "test"):
         for q in circuit_questions(split, styles=tuple(PromptStyle)):
             assert q.prompt().endswith(ANSWER_INSTRUCTION + "\nAnswer:")

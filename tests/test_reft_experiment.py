@@ -49,7 +49,18 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
     path = next((tmp_path / "runs").glob("*-reft-*/report.json"))
     report = json.loads(path.read_text())
     assert report["locality_weight"] == report["preservation_weight"] == 1
-    assert report["train_scheme"] == "and_copy"
+    assert report["train_schemes"] == ["and_copy", "and_inverted"]
+    assert report["loss_mode"] == "full_vocab"
+    assert report["intervention_mode"] == "replace_equation"
+    assert report["answer_protocol"]["training_completion_ids"] == [[2, 0], [3, 0]]
+    assert report["test_groups"]["seen_mechanisms"] == ["and_copy", "and_inverted"]
+    assert "and_xor_chain" in report["test_groups"]["held_out_mechanisms_or_topologies"]
+    assert len(report["split"]["train"]) == 240
+    assert len(report["split"]["validation"]) == 80
+    assert all(
+        key.startswith(("train_and_copy_", "train_and_inverted_"))
+        for key in report["split"]["train"]
+    )
     assert set(report["test"]) == {
         "and_copy",
         "or_copy",
@@ -57,13 +68,15 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
         "and_chain",
         "and_inverted",
         "and_xor",
+        "and_inverted_chain",
+        "and_xor_chain",
     }
     assert set(report["training"]["relay_0"]) == {"loreft_task", "loreft_locality"}
     assert all(
         entry["alpha"] == 0 for choices in report["selected"].values() for entry in choices.values()
     )
     assert report["rollback"]["max_score_difference"] == 0
-    assert report["experiment"] == "loreft_causal_suite_v3"
+    assert report["experiment"] == "loreft_causal_suite_v4"
     assert report["answer_protocol"]["candidates"] == ["0", "1"]
     assert report["site"]["boundary"] == "prompt"
     assert report["site"]["prefix"] == []
@@ -73,7 +86,7 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
     for trial in location["trials"]:
         assert trial["self_patch_max_score_difference"] < 1e-5
         assert all(
-            record["key"].startswith("validation_and_copy_")
+            record["key"].startswith(("validation_and_copy_", "validation_and_inverted_"))
             for m in trial["by_operator"].values()
             for record in m["records"]
         )
@@ -128,7 +141,7 @@ def test_das_targets_are_base_counterfactuals_not_source_answers(tmp_path):
     for scheme, nodes in report["test"].items():
         for methods in nodes.values():
             assert {"base", "das", "random_subspace", "full_donor"} == set(methods)
-            assert methods["das"]["count"] == (384 if scheme == "and_chain" else 320)
+            assert methods["das"]["count"] == (384 if scheme.endswith("chain") else 320)
             assert 0 <= methods["das"]["interchange_accuracy"] <= 1
             assert "both_natural_correct" in methods["das"]
     assert tensors

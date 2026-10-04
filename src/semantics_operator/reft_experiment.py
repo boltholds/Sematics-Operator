@@ -9,9 +9,25 @@ import torch
 from safetensors.torch import save_file
 
 from .answer_protocol import protocol_metadata
-from .causal_tasks import PromptStyle, Scheme, circuit_questions, metrics, selection
+from .causal_tasks import (
+    TRAIN_SCHEMES,
+    InterventionMode,
+    PromptStyle,
+    Scheme,
+    circuit_questions,
+    metrics,
+    selection,
+    training_questions,
+)
 from .conditional import fit_map, fit_pca_map, predict
 from .experiment import SCENARIOS, resolve_sequence
+from .full_vocab import (
+    LossMode,
+    answer_sequences,
+    full_vocab_loss,
+    reference_distributions,
+    teacher_forced_logits,
+)
 from .generation_evaluation import (
     attach_candidate_agreement,
     generate_questions,
@@ -63,21 +79,48 @@ def train_batches(samples, op, steps, seed):
     for indices in groups.values():
         if {samples[i].node for i in indices} != set(samples[indices[0]].world.values()):
             raise ValueError("Training requires every question role for each state/style")
-    changed, stable = [], []
-    for indices in groups.values():
-        pool = (
-            changed
-            if any(samples[i].answer((op,)) != samples[i].answer() for i in indices)
-            else stable
-        )
-        pool.append(tuple(indices))
-    pools = [changed or stable.copy(), stable or changed.copy()]
-    for pool in pools:
-        rng.shuffle(pool)
-    return [pools[t % 2][(t // 2) % len(pools[t % 2])] for t in range(steps)]
+    schemes = list(dict.fromkeys(q.world.scheme for q in samples))
+    pools = {}
+    for scheme in schemes:
+        changed, stable = [], []
+        for indices in groups.values():
+            if samples[indices[0]].world.scheme != scheme:
+                continue
+            pool = (
+                changed
+                if any(samples[i].answer((op,)) != samples[i].answer() for i in indices)
+                else stable
+            )
+            pool.append(tuple(indices))
+        pools[scheme] = [changed or stable.copy(), stable or changed.copy()]
+        for pool in pools[scheme]:
+            rng.shuffle(pool)
+    result = []
+    for t in range(steps):
+        cycle, scheme = t // len(schemes), schemes[t % len(schemes)]
+        pool = pools[scheme][cycle % 2]
+        result.append(pool[(cycle // 2) % len(pool)])
+    return result
 
 
-def train_loreft(lm, cfg, samples, baseline, site, prefix, op, hidden_size, locality, progress):
+def train_loreft(
+    lm,
+    cfg,
+    samples,
+    baseline,
+    site,
+    prefix,
+    op,
+    hidden_size,
+    locality,
+    progress,
+    *,
+    loss_mode=LossMode.BINARY,
+    full_reference=None,
+):
+    loss_mode = LossMode(loss_mode)
+    if loss_mode == LossMode.FULL_VOCAB and full_reference is None:
+        raise ValueError("Full-vocabulary training requires protected reference distributions")
     model = LoReFT(hidden_size, cfg.rank, cfg.seed).to(lm.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
     batches = train_batches(samples, op, cfg.steps, cfg.seed)
@@ -92,6 +135,32 @@ def train_loreft(lm, cfg, samples, baseline, site, prefix, op, hidden_size, loca
         # Accumulate the exact full-state mean CE + mean KL, without retaining all graphs.
         for start in range(0, len(batch), 2):
             micro = batch[start : start + 2]
+            if loss_mode == LossMode.FULL_VOCAB:
+                targets = answer_sequences(lm, [q.answer((op,)) for q in micro])
+                token_logits = teacher_forced_logits(
+                    lm, [q.prompt() for q in micro], targets, site=site, transform=model
+                )
+                loss, chunk_parts, details = full_vocab_loss(
+                    token_logits,
+                    [full_reference[i] for i in indices[start : start + 2]],
+                    targets,
+                    [q.node in q.world.affected(op) for q in micro],
+                    locality,
+                    normalization_counts=counts,
+                )
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Non-finite full-vocabulary LoReFT loss")
+                loss.backward()
+                total += float(loss.detach())
+                for key, value in chunk_parts.items():
+                    parts[key] += value
+                for q, detail in zip(micro, details, strict=True):
+                    by_node[q.node.value] = {
+                        "count": 1,
+                        "affected": q.node in q.world.affected(op),
+                        **detail,
+                    }
+                continue
             scores = intervention_scores(lm, [q.prompt() for q in micro], site, prefix, model)
             labels = torch.tensor([q.answer((op,)) for q in micro], device=lm.device)
             affected = torch.tensor(
@@ -136,6 +205,8 @@ def train_loreft(lm, cfg, samples, baseline, site, prefix, op, hidden_size, loca
             progress(f"LoReFT {op.key} locality={locality}: {step + 1}/{cfg.steps} {parts}")
     return model.eval(), {
         "locality_weight": locality,
+        "loss_mode": loss_mode.value,
+        "schemes": [s.value for s in dict.fromkeys(q.world.scheme for q in samples)],
         "batching": "full_state",
         "microbatch_size": 2,
         "styles": list(dict.fromkeys(q.style.value for q in samples)),
@@ -155,6 +226,8 @@ def run_reft_suite(
     strengths=None,
     pca_components=None,
     preservation_weight=1.0,
+    loss_mode=LossMode.FULL_VOCAB,
+    train_schemes=TRAIN_SCHEMES,
     progress=lambda _: None,
 ):
     strengths = [0, 0.5, 1, 2] if strengths is None else strengths
@@ -169,9 +242,13 @@ def run_reft_suite(
     if type(max_new_tokens) is not int or max_new_tokens < 1:
         raise ValueError("max_new_tokens must be a positive integer")
     answer_protocol = protocol_metadata(lm)
+    loss_mode = LossMode(loss_mode)
+    if loss_mode == LossMode.FULL_VOCAB:
+        answer_protocol["training_completion_ids"] = answer_sequences(lm, [0, 1])
     prefix = []
-    train = circuit_questions("train", styles=tuple(PromptStyle))
-    val = circuit_questions("validation")
+    train = training_questions("train", train_schemes, styles=tuple(PromptStyle))
+    val = training_questions("validation", train_schemes)
+    train_schemes = tuple(dict.fromkeys(q.world.scheme for q in train))
     methods = (
         "constant",
         "ridge",
@@ -186,9 +263,14 @@ def run_reft_suite(
             [layer] if localization_layers is None else localization_layers,
             preservation_weight,
             progress,
+            samples=val,
         )
         base_train, base_val = evaluate(lm, train, site, prefix), evaluate(lm, val, site, prefix)
         x = capture_states(lm, [q.prompt() for q in train], site, prefix)
+        full_reference = None
+        if loss_mode == LossMode.FULL_VOCAB:
+            progress("Caching full-vocabulary protected distributions (CPU)")
+            full_reference = reference_distributions(lm, train)
         for op in OPERATORS:
             progress(f"Training and selecting {op.key}")
             donor = capture_states(lm, [q.prompt((op,)) for q in train], site, prefix)
@@ -202,7 +284,18 @@ def run_reft_suite(
                 ("loreft_locality", cfg.locality_weight),
             ):
                 model, log = train_loreft(
-                    lm, cfg, train, base_train, site, prefix, op, x.shape[1], locality, progress
+                    lm,
+                    cfg,
+                    train,
+                    base_train,
+                    site,
+                    prefix,
+                    op,
+                    x.shape[1],
+                    locality,
+                    progress,
+                    loss_mode=loss_mode,
+                    full_reference=full_reference,
                 )
                 fitted[op.key][method], training[op.key][method] = model, log
             selected[op.key], trials[op.key] = {}, {}
@@ -308,7 +401,9 @@ def run_reft_suite(
         if not torch.allclose(restored, base_train, atol=1e-5, rtol=1e-5):
             raise RuntimeError("LoReFT rollback failed")
     return {
-        "experiment": "loreft_causal_suite_v3",
+        "experiment": "loreft_causal_suite_v4",
+        "loss_mode": loss_mode.value,
+        "intervention_mode": InterventionMode.REPLACE_EQUATION.value,
         "answer_protocol": answer_protocol,
         "localization": localization,
         "max_new_tokens": max_new_tokens,
@@ -321,7 +416,13 @@ def run_reft_suite(
         "preservation_weight": preservation_weight,
         "strengths": strengths,
         "site": {"path": site, "kind": "block", "boundary": "prompt", "prefix": prefix},
-        "train_scheme": Scheme.AND_COPY.value,
+        "train_schemes": [s.value for s in train_schemes],
+        "test_groups": {
+            "seen_mechanisms": [s.value for s in train_schemes],
+            "held_out_mechanisms_or_topologies": [
+                s.value for s in Scheme if s not in train_schemes
+            ],
+        },
         "split": {
             "train": [q.key for q in train],
             "validation": [q.key for q in val],
@@ -340,16 +441,18 @@ def run_reft_suite(
         "sources": ["https://arxiv.org/abs/2404.03592", "https://arxiv.org/abs/2110.11309"],
         "limitations": [
             "Native LoReFT equation with QR basis and identity initialization; not a reproduction of paper benchmarks or the pyreft optimizer setup.",
-            "CE and forward locality KL use normalized scores for only 0/1 candidates, not the full vocabulary distribution.",
+            "Full-vocabulary mode uses token CE including one EOS and forward KL over the complete vocabulary; binary mode retains the two-candidate objective. Alpha selection and non-greedy metrics still use bare 0/1 ranking without EOS.",
+            "Protected KL uses the same teacher-forced natural answer history for baseline and intervention, averaged over its tokens including EOS. It does not constrain arbitrary generated histories.",
+            "The first configured EOS ID is the training target; generation accepts all configured stop IDs. The intervention stays at the original prompt position. An edit at the final block cannot influence later teacher-forced positions, so an EOS objective alone cannot guarantee completion.",
             "Task labels supervise affected variables; locality preserves every unaffected query, including relay for lamp edits. Symbolic masks are used only in training.",
             "Locality is a soft training objective, not a guarantee. loreft_task is an identically initialized zero-locality ablation.",
-            "Each optimizer step contains every role for one world and wording style, with microbatch accumulation. Changed/stable worlds alternate. The three training styles change the data and compute budget relative to v1.",
+            "Each step contains every role for one world/style, with microbatch accumulation. Training schemes alternate; within each scheme changed/stable worlds alternate. Validation and held-out evaluation use the default wording; train uses three styles.",
             "Training by-node losses are measured before each update on the scheduled batch; fixed-alpha train metrics evaluate the final operator on every training question.",
             "Fixed-alpha=1 diagnostics cover primitive operations on train, validation and test, independently of validation selection; they are not used to choose operators. Compositions in test use selected strengths only.",
             "Donor-regression baselines have different supervision from LoReFT; they share train worlds, site and validation alpha grid.",
             "Compositions sequentially transform the same hidden vector; they do not rerun the network between primitive operators.",
             "Revision uses external latest-write-wins resolution, not learned contradiction detection.",
-            "New schemes are test-only, but all use Boolean variables and the same names. No arbitrary-text reasoning claim.",
+            "COPY and NOT are the default training mechanisms; other mechanisms and all bridge topologies remain test-only. Seen-mechanism test wording is reported separately from held-out structures. All tasks use Boolean variables and the same names; no arbitrary-text reasoning claim.",
             "Candidate layer list may reflect earlier experiments. One shared block is selected by mean validation donor-transfer objectives; this need not be the best layer for learned LoReFT. Training continues even if no donor site beats the no-patch baseline, with that outcome explicitly recorded.",
             "Validation donors select the intervention site; test donors remain separate privileged diagnostics. Shifted schemes never participate in fitting or selection. Base model weights remain frozen.",
             "Scoring, training and free generation intervene at the same last prompt token with bare 0/1 candidates and no forced prefix. Greedy decoding uses the full vocabulary, so it can disagree with binary ranking or fail the required format.",
@@ -447,6 +550,20 @@ def save_research(root, report, tensors):
     )
     lines = ["# " + report["experiment"], ""]
     if kind == "reft":
+        lines += [
+            "## Run protocol",
+            "",
+            f"Loss: `{report.get('loss_mode', 'binary')}`; intervention: `{report.get('intervention_mode', 'legacy_override')}`.",
+            "",
+            "Training / validation mechanisms: "
+            + ", ".join(report.get("train_schemes", ["and_copy"]))
+            + ".",
+            "",
+            "Held-out mechanisms / topologies: "
+            + ", ".join(report.get("test_groups", {}).get("held_out_mechanisms_or_topologies", []))
+            + ".",
+            "",
+        ]
         lines += [
             "| Scheme | Scenario | Method | Accuracy | All nodes | New protected errors |",
             "|---|---|---|---:|---:|---:|",

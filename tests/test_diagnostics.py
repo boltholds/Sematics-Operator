@@ -66,5 +66,5 @@ def test_diagnose_cli_saves_raw_generation_and_both_candidate_formats(tmp_path):
                 assert record["stop_reason"] in ("eos", "max_new_tokens")
     assert set(report["splits"]["train"]) == {"and_copy"}
     assert set(report["splits"]["validation"]) == {"and_copy"}
-    assert len(report["splits"]["test"]) == 6
+    assert len(report["splits"]["test"]) == 8
     assert (path.parent / "summary.md").is_file()

@@ -1,4 +1,4 @@
-"""Explicit Boolean SCMs: train on AND/copy, test on held-out mechanisms/topology."""
+"""Boolean SCMs with COPY/NOT training and held-out mechanisms/topologies."""
 
 from dataclasses import dataclass
 from enum import StrEnum
@@ -15,6 +15,17 @@ class Scheme(StrEnum):
     AND_CHAIN = "and_chain"
     AND_INVERTED = "and_inverted"
     AND_XOR = "and_xor"
+    AND_INVERTED_CHAIN = "and_inverted_chain"
+    AND_XOR_CHAIN = "and_xor_chain"
+
+
+TRAIN_SCHEMES = (Scheme.AND_COPY, Scheme.AND_INVERTED)
+CHAIN_SCHEMES = (Scheme.AND_CHAIN, Scheme.AND_INVERTED_CHAIN, Scheme.AND_XOR_CHAIN)
+
+
+class InterventionMode(StrEnum):
+    REPLACE_EQUATION = "replace_equation"
+    LEGACY_OVERRIDE = "legacy_override"
 
 
 class CircuitNode(StrEnum):
@@ -49,9 +60,9 @@ class CircuitWorld:
         )
         relay = overrides.get("relay", relay)
         lamp = relay & self.flag if self.scheme == Scheme.AND_GATED else relay
-        if self.scheme == Scheme.AND_INVERTED:
+        if self.scheme in (Scheme.AND_INVERTED, Scheme.AND_INVERTED_CHAIN):
             lamp = 1 - relay
-        elif self.scheme == Scheme.AND_XOR:
+        elif self.scheme in (Scheme.AND_XOR, Scheme.AND_XOR_CHAIN):
             lamp = relay ^ self.flag
         values = {
             CircuitNode.SOURCE: self.source,
@@ -60,15 +71,15 @@ class CircuitWorld:
             CircuitNode.LAMP: overrides.get("lamp", lamp),
             CircuitNode.FLAG: self.flag,
         }
-        if self.scheme == Scheme.AND_CHAIN:
-            values[CircuitNode.BRIDGE] = relay
+        if self.scheme in CHAIN_SCHEMES:
+            values[CircuitNode.BRIDGE] = lamp
         return values
 
     def affected(self, op):
         if op.node == Node.LAMP:
             return {CircuitNode.LAMP}
         nodes = {CircuitNode.RELAY, CircuitNode.LAMP}
-        if self.scheme == Scheme.AND_CHAIN:
+        if self.scheme in CHAIN_SCHEMES:
             nodes.add(CircuitNode.BRIDGE)
         return nodes
 
@@ -92,20 +103,31 @@ class CircuitQuestion:
     def answer(self, interventions=()):
         return self.world.values(interventions)[self.node]
 
-    def prompt(self, interventions=()):
+    def prompt(self, interventions=(), *, mode=InterventionMode.REPLACE_EQUATION):
+        mode = InterventionMode(mode)
         w = self.world
         gate = "OR" if w.scheme == Scheme.OR_COPY else "AND"
-        rules = f"relay = source {gate} switch; "
+        equations = {"relay": f"source {gate} switch"}
         if w.scheme == Scheme.AND_GATED:
-            rules += "lamp = relay AND flag. "
-        elif w.scheme == Scheme.AND_CHAIN:
-            rules += "bridge = relay; lamp = bridge. "
+            equations["lamp"] = "relay AND flag"
+        elif w.scheme in CHAIN_SCHEMES:
+            equations["bridge"] = {
+                Scheme.AND_CHAIN: "relay",
+                Scheme.AND_INVERTED_CHAIN: "NOT relay (NOT 0 = 1; NOT 1 = 0)",
+                Scheme.AND_XOR_CHAIN: "relay XOR flag (XOR is 1 exactly when its inputs differ)",
+            }[w.scheme]
+            equations["lamp"] = "bridge"
         elif w.scheme == Scheme.AND_INVERTED:
-            rules += "lamp = NOT relay (NOT 0 = 1; NOT 1 = 0). "
+            equations["lamp"] = "NOT relay (NOT 0 = 1; NOT 1 = 0)"
         elif w.scheme == Scheme.AND_XOR:
-            rules += "lamp = relay XOR flag (XOR is 1 exactly when its inputs differ). "
+            equations["lamp"] = "relay XOR flag (XOR is 1 exactly when its inputs differ)"
         else:
-            rules += "lamp = relay. "
+            equations["lamp"] = "relay"
+        overrides = {op.node.value: op.value for op in interventions}
+        if mode == InterventionMode.REPLACE_EQUATION:
+            for node, value in overrides.items():
+                equations[node] = str(value)
+        rules = "; ".join(f"{node} = {expression}" for node, expression in equations.items()) + ". "
         facts = f"source={w.source}; switch={w.switch}; flag={w.flag}. "
         if self.split == "train":
             text = f"Circuit {w.name}: {facts}Rules: {rules}"
@@ -131,19 +153,26 @@ class CircuitQuestion:
             }[self.split]
             text = f"{header} {self.node.value} for {w.name}. Equations: {rules}Inputs: {facts}"
         if interventions:
-            overrides = {op.node: op.value for op in interventions}
-            text += (
-                "Override these rules: "
-                + "; ".join(f"force {n.value}={v}" for n, v in overrides.items())
-                + ". "
-            )
+            if mode == InterventionMode.LEGACY_OVERRIDE:
+                text += (
+                    "Override these rules: "
+                    + "; ".join(f"force {n}={v}" for n, v in overrides.items())
+                    + ". "
+                )
+            else:
+                text += (
+                    "The equations above already include the intervention: only the equations for "
+                    + ", ".join(overrides)
+                    + " were replaced; all other equations and inputs are unchanged. "
+                )
         return text + f"What is {self.node.value}? " + ANSWER_INSTRUCTION + "\nAnswer:"
 
 
 def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFAULT,)):
     if split not in ("train", "validation", "test"):
         raise ValueError("Unknown split")
-    if split != "test" and scheme != Scheme.AND_COPY:
+    scheme = Scheme(scheme)
+    if split != "test" and scheme not in TRAIN_SCHEMES:
         raise ValueError("Shifted schemes are test-only")
     styles = tuple(PromptStyle(s) for s in styles)
     if not styles or len(set(styles)) != len(styles):
@@ -155,6 +184,19 @@ def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFA
             CircuitQuestion(w, node, split, style) for style in styles for node in w.values()
         )
     return tuple(result)
+
+
+def training_questions(split, schemes=TRAIN_SCHEMES, *, styles=(PromptStyle.DEFAULT,)):
+    schemes = tuple(Scheme(s) for s in schemes)
+    if (
+        not schemes
+        or len(set(schemes)) != len(schemes)
+        or any(s not in TRAIN_SCHEMES for s in schemes)
+    ):
+        raise ValueError(
+            "Training schemes must be unique COPY/NOT mechanisms; other schemes are test-only"
+        )
+    return tuple(q for s in schemes for q in circuit_questions(split, s, styles=styles))
 
 
 @dataclass(frozen=True)

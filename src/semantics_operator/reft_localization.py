@@ -9,13 +9,15 @@ from .world import OPERATORS
 
 
 @torch.no_grad()
-def locate_block(lm, layers, preservation_weight, progress=lambda _: None):
+def locate_block(lm, layers, preservation_weight, progress=lambda _: None, *, samples=None):
     catalog = discover_sites(lm)
     layers = sorted(set(layers))
     if not layers or any(type(i) is not int or i not in catalog for i in layers):
         raise ValueError(f"Provide existing decoder layer indices: {sorted(catalog)}")
     sites = [catalog[i]["block"] for i in layers]
-    samples = circuit_questions("validation")
+    samples = circuit_questions("validation") if samples is None else samples
+    if not samples or any(q.split != "validation" for q in samples):
+        raise ValueError("Block selection requires validation questions")
     prompts = [q.prompt() for q in samples]
     base = torch.cat(
         [
@@ -97,8 +99,9 @@ def locate_block(lm, layers, preservation_weight, progress=lambda _: None):
         "boundary": "prompt",
         "forced_prefix": [],
         "capture_context": "candidate_scoring_forward",
+        "validation_schemes": list(dict.fromkeys(q.world.scheme.value for q in samples)),
         "trials": trials,
         "baseline_objective": base_objective,
         "beats_no_patch": beats_base,
-        "selection": "Lexicographic mean of per-operator preservation-penalized objectives on validation AND/copy; ties prefer lower block index.",
+        "selection": "Lexicographic mean of per-operator preservation-penalized objectives on the configured training mechanisms' validation questions; ties prefer lower block index.",
     }

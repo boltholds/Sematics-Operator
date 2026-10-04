@@ -23,6 +23,24 @@ def main(argv=None) -> int:
         "--max-new-tokens", type=int, default=16, help="Greedy token budget for diagnose/reft"
     )
     parser.add_argument(
+        "--intervention-audit",
+        action="store_true",
+        help="diagnose: compare legacy force instructions with equation replacement",
+    )
+    parser.add_argument(
+        "--loss-mode",
+        choices=("full_vocab", "binary"),
+        default="full_vocab",
+        help="reft: digit+EOS full-vocabulary loss (default) or binary-candidate ablation",
+    )
+    parser.add_argument(
+        "--train-schemes",
+        nargs="+",
+        choices=("and_copy", "and_inverted"),
+        default=["and_copy", "and_inverted"],
+        help="reft: training and validation mechanisms",
+    )
+    parser.add_argument(
         "--layers",
         nargs="+",
         help="MLP paths; compare block: indices/paths; reft: block candidates; das: one block (default 12)",
@@ -80,6 +98,17 @@ def main(argv=None) -> int:
 
         lm = LocalLanguageModel.load(cfg)
         if args.command == "diagnose":
+            if args.intervention_audit:
+                from .intervention_diagnostics import (
+                    run_intervention_diagnostics,
+                    save_intervention_diagnostics,
+                )
+
+                report = run_intervention_diagnostics(
+                    lm, cfg, max_new_tokens=args.max_new_tokens, progress=print
+                )
+                print(f"Results: {save_intervention_diagnostics(cfg.output_dir, report)}")
+                return 0
             from .diagnostics import run_diagnostics, save_diagnostics
 
             report = run_diagnostics(lm, cfg, max_new_tokens=args.max_new_tokens, progress=print)
@@ -102,6 +131,8 @@ def main(argv=None) -> int:
                     pca_components=args.pca_components or None,
                     preservation_weight=args.preservation_weight,
                     progress=print,
+                    loss_mode=args.loss_mode,
+                    train_schemes=args.train_schemes,
                 )
             else:
                 from .das_experiment import run_das

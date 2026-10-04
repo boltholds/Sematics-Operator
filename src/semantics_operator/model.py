@@ -159,16 +159,7 @@ class LocalLanguageModel:
             raise ValueError(
                 "Prompt plus max_new_tokens exceeds max_length; increase it explicitly"
             )
-        eos = None
-        for config in (
-            getattr(self.model, "generation_config", None),
-            self.model.config,
-            self.tokenizer,
-        ):
-            eos = getattr(config, "eos_token_id", None)
-            if eos is not None:
-                break
-        stop_ids = set(eos if isinstance(eos, (list, tuple)) else [] if eos is None else [eos])
+        stop_ids = set(self.eos_token_ids())
         results = []
         for prefix in prefixes:
             generated, reason = [], "max_new_tokens"
@@ -190,6 +181,18 @@ class LocalLanguageModel:
                 }
             )
         return results
+
+    def eos_token_ids(self) -> list[int]:
+        eos = None
+        for config in (
+            getattr(self.model, "generation_config", None),
+            self.model.config,
+            self.tokenizer,
+        ):
+            eos = getattr(config, "eos_token_id", None)
+            if eos is not None:
+                break
+        return list(eos) if isinstance(eos, (list, tuple)) else [] if eos is None else [eos]
 
     @torch.no_grad()
     def representations(self, prompts: list[str], target: str) -> Tensor:
