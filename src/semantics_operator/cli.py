@@ -8,15 +8,20 @@ from .config import load_settings
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Reversible weight-space semantic experiments")
-    parser.add_argument("command", choices=("inspect", "run", "steer", "compare", "localize"))
+    parser.add_argument(
+        "command", choices=("inspect", "run", "steer", "compare", "localize", "reft", "das")
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default="", help="Named model profile in TOML")
     parser.add_argument("--steps", type=int, help="Override steps per primitive operator")
+    parser.add_argument("--rank", type=int, help="Low-rank dimension for run/reft/das")
+    parser.add_argument("--learning-rate", type=float, help="Training learning rate")
+    parser.add_argument("--locality-weight", type=float, help="Training locality loss weight")
     parser.add_argument(
         "--layers",
         nargs="+",
-        help="MLP module paths; for compare --site-kind block: block indices or paths",
+        help="MLP paths; compare --site-kind block: indices/paths; reft/das: one block index (default 12)",
     )
     parser.add_argument(
         "--site-kind", choices=("mlp", "block"), default="mlp", help="compare injection site"
@@ -31,7 +36,7 @@ def main(argv=None) -> int:
         "--preservation-weight",
         type=float,
         default=0.0,
-        help="compare validation penalty for new source/switch/flag errors",
+        help="compare/reft validation penalty for new source/switch/flag errors",
     )
     parser.add_argument(
         "--strengths", nargs="+", type=float, help="Validation steering grid; zero always included"
@@ -44,7 +49,7 @@ def main(argv=None) -> int:
         nargs="+",
         type=int,
         default=[],
-        help="Train-only PCA ranks for compare; enables exact-donor diagnostics",
+        help="Train-only PCA ranks for compare/reft; enables compare exact-donor diagnostics",
     )
     parser.add_argument(
         "--layer-sets", nargs="+", help="Layer index sets for localize, e.g. 8 6,7,8 2,5,8"
@@ -63,9 +68,35 @@ def main(argv=None) -> int:
         cfg = load_settings(args.config, args.env_file, args.model)
         if args.steps is not None:
             cfg = replace(cfg, steps=args.steps)
+        for key in ("rank", "learning_rate", "locality_weight"):
+            value = getattr(args, key)
+            if value is not None:
+                cfg = replace(cfg, **{key: value})
         from .model import LocalLanguageModel
 
         lm = LocalLanguageModel.load(cfg)
+        if args.command in ("reft", "das"):
+            from .reft_experiment import run_reft_suite, save_research
+
+            if args.layers and len(args.layers) != 1:
+                raise ValueError("reft/das require one block index, e.g. --layers 12")
+            layer = int(args.layers[0]) if args.layers else 12
+            if args.command == "reft":
+                report, tensors = run_reft_suite(
+                    lm,
+                    cfg,
+                    layer=layer,
+                    strengths=args.strengths,
+                    pca_components=args.pca_components or None,
+                    preservation_weight=args.preservation_weight,
+                    progress=print,
+                )
+            else:
+                from .das_experiment import run_das
+
+                report, tensors = run_das(lm, cfg, layer=layer, progress=print)
+            print(f"Results: {save_research(cfg.output_dir, report, tensors)}")
+            return 0
         if args.command == "inspect":
             print(f"Profile: {cfg.profile}; device: {lm.device}")
             for name, shape in lm.linear_modules().items():
