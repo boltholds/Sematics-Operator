@@ -20,12 +20,12 @@ def main(argv=None) -> int:
     parser.add_argument("--learning-rate", type=float, help="Training learning rate")
     parser.add_argument("--locality-weight", type=float, help="Training locality loss weight")
     parser.add_argument(
-        "--max-new-tokens", type=int, default=16, help="Greedy token budget for diagnose"
+        "--max-new-tokens", type=int, default=16, help="Greedy token budget for diagnose/reft"
     )
     parser.add_argument(
         "--layers",
         nargs="+",
-        help="MLP paths; compare --site-kind block: indices/paths; reft/das: one block index (default 12)",
+        help="MLP paths; compare block: indices/paths; reft: block candidates; das: one block (default 12)",
     )
     parser.add_argument(
         "--site-kind", choices=("mlp", "block"), default="mlp", help="compare injection site"
@@ -88,14 +88,16 @@ def main(argv=None) -> int:
         if args.command in ("reft", "das"):
             from .reft_experiment import run_reft_suite, save_research
 
-            if args.layers and len(args.layers) != 1:
-                raise ValueError("reft/das require one block index, e.g. --layers 12")
+            if args.command == "das" and args.layers and len(args.layers) != 1:
+                raise ValueError("das requires one block index, e.g. --layers 12")
             layer = int(args.layers[0]) if args.layers else 12
             if args.command == "reft":
                 report, tensors = run_reft_suite(
                     lm,
                     cfg,
                     layer=layer,
+                    localization_layers=[int(i) for i in args.layers] if args.layers else None,
+                    max_new_tokens=args.max_new_tokens,
                     strengths=args.strengths,
                     pca_components=args.pca_components or None,
                     preservation_weight=args.preservation_weight,

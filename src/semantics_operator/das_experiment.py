@@ -5,8 +5,8 @@ import random
 import torch
 from torch.nn import functional as F
 
+from .answer_protocol import protocol_metadata
 from .causal_tasks import Scheme, circuit_questions, interchange_pairs
-from .localization import common_prefix
 from .reft import DAS, frozen_model, intervention_scores
 from .reft_experiment import block_site, capture_states, evaluate
 from .world import Node
@@ -77,7 +77,7 @@ def score_pairs(lm, pairs, state, lookup, site, prefix, transform):
 
 
 def run_das(lm, cfg, *, layer=12, progress=lambda _: None):
-    site, prefix = block_site(lm, layer), common_prefix(lm)
+    site, prefix = block_site(lm, layer), []
     train = circuit_questions("train")
     pairs = interchange_pairs(train)
     lookup = {q.key: i for i, q in enumerate(train)}
@@ -174,14 +174,15 @@ def run_das(lm, cfg, *, layer=12, progress=lambda _: None):
         if not torch.allclose(restored, natural_train, atol=1e-5, rtol=1e-5):
             raise RuntimeError("DAS rollback failed")
     return {
-        "experiment": "das_causal_alignment_v1",
+        "experiment": "das_causal_alignment_v2",
+        "answer_protocol": protocol_metadata(lm),
         "model": {"profile": cfg.profile, "device": str(lm.device)},
         "seed": cfg.seed,
         "rank": cfg.rank,
         "steps": cfg.steps,
         "learning_rate": cfg.learning_rate,
         "train_scheme": Scheme.AND_COPY.value,
-        "site": {"path": site, "kind": "block", "boundary": "decision", "prefix": prefix},
+        "site": {"path": site, "kind": "block", "boundary": "prompt", "prefix": prefix},
         "training": logs,
         "validation": validation,
         "test": tests,

@@ -14,7 +14,14 @@ def test_diagnostic_metrics_keep_invalid_generations_and_zero_one_errors():
             {"expected": 1, "prediction": 1, "node": "lamp", "style": "verbal"},
         ]
     )
-    assert result["overall"] == {"count": 4, "accuracy": 0.5, "errors": 2, "invalid": 1}
+    assert result["overall"] == {
+        "count": 4,
+        "accuracy": 0.5,
+        "errors": 2,
+        "invalid": 1,
+        "incomplete": 0,
+        "format_errors": 0,
+    }
     assert result["by_label"]["0"]["errors"] == 1
     assert result["by_label"]["1"]["invalid"] == 1
     assert result["prediction_counts"] == {"0": 1, "1": 2, "invalid": 1}
@@ -48,7 +55,7 @@ def test_diagnose_cli_saves_raw_generation_and_both_candidate_formats(tmp_path):
     )
     path = next((tmp_path / "runs").glob("*-diagnose-*/report.json"))
     report = json.loads(path.read_text())
-    assert report["experiment"] == "base_answer_diagnostics_v1"
+    assert report["experiment"] == "base_answer_diagnostics_v2"
     assert report["max_new_tokens"] == 1
     for schemes in report["splits"].values():
         for modes in schemes.values():
@@ -59,5 +66,5 @@ def test_diagnose_cli_saves_raw_generation_and_both_candidate_formats(tmp_path):
                 assert record["stop_reason"] in ("eos", "max_new_tokens")
     assert set(report["splits"]["train"]) == {"and_copy"}
     assert set(report["splits"]["validation"]) == {"and_copy"}
-    assert len(report["splits"]["test"]) == 4
+    assert len(report["splits"]["test"]) == 6
     assert (path.parent / "summary.md").is_file()

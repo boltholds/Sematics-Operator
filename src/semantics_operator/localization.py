@@ -60,7 +60,9 @@ def capture_tail(lm, prompts, sites, window, prefix):
 
 
 @torch.no_grad()
-def patched_scores(lm, prompts, donor, sites, window, prefix, *, replace=True):
+def patched_scores(
+    lm, prompts, donor, sites, window, prefix, *, replace=True, candidates=(" 0", " 1")
+):
     ends = [len(lm._prompt_ids(p)) + len(prefix) for p in prompts for _ in (0, 1)]
     handles = []
     try:
@@ -81,7 +83,7 @@ def patched_scores(lm, prompts, donor, sites, window, prefix, *, replace=True):
                 return tensor
 
             handles.append(lm.model.get_submodule(site).register_forward_hook(hook))
-        return lm.scores(prompts).detach().cpu()
+        return lm.scores(prompts, candidates=candidates).detach().cpu()
     finally:
         for handle in handles:
             handle.remove()

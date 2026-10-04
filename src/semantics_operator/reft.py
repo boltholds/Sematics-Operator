@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .answer_protocol import BARE_CANDIDATES
 from .localization import hidden
 
 
@@ -57,17 +58,19 @@ def frozen_model(lm):
             p.requires_grad_(flag)
 
 
-def intervention_scores(lm, prompts, site, prefix, transform):
-    """Differentiable one-position hook; never consumes the distinguishing digit."""
-    ends = [len(lm._prompt_ids(p)) + len(prefix) - 1 for p in prompts for _ in (0, 1)]
+@contextmanager
+def activation_intervention(lm, site, positions, transform):
+    """The same fixed prompt-position intervention for scoring and autoregressive decoding."""
 
     def hook(module, args, output):
         tensor = hidden(output)
-        rows = torch.arange(len(ends), device=tensor.device)
-        positions = torch.tensor(ends, device=tensor.device)
-        changed = transform(tensor[rows, positions])
+        if tensor.shape[0] != len(positions):
+            raise ValueError("Intervention positions must match the forward batch")
+        rows = torch.arange(len(positions), device=tensor.device)
+        index = torch.tensor(positions, device=tensor.device)
+        changed = transform(tensor[rows, index])
         result = tensor.clone()
-        result[rows, positions] = changed.to(result)
+        result[rows, index] = changed.to(result)
         if isinstance(output, tuple):
             return (result, *output[1:])
         if isinstance(output, list):
@@ -76,9 +79,28 @@ def intervention_scores(lm, prompts, site, prefix, transform):
 
     handle = lm.model.get_submodule(site).register_forward_hook(hook)
     try:
-        return lm.scores(prompts)
+        yield
     finally:
         handle.remove()
+
+
+def intervention_scores(lm, prompts, site, prefix, transform):
+    """Bare candidates; edit the last prompt token before any answer token exists."""
+    if prefix:
+        raise ValueError("Bare digit interventions require an empty prefix")
+    positions = [len(lm._prompt_ids(p)) - 1 for p in prompts for _ in (0, 1)]
+    with activation_intervention(lm, site, positions, transform):
+        return lm.scores(prompts, candidates=BARE_CANDIDATES)
+
+
+@torch.no_grad()
+def intervention_generate(lm, prompts, site, transform, *, max_new_tokens=16):
+    results = []
+    for prompt in prompts:
+        position = len(lm._prompt_ids(prompt)) - 1
+        with activation_intervention(lm, site, [position], transform):
+            results.extend(lm.generate_greedy([prompt], max_new_tokens=max_new_tokens))
+    return results
 
 
 def task_locality_loss(

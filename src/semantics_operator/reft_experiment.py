@@ -8,11 +8,18 @@ from uuid import uuid4
 import torch
 from safetensors.torch import save_file
 
+from .answer_protocol import protocol_metadata
 from .causal_tasks import PromptStyle, Scheme, circuit_questions, metrics, selection
 from .conditional import fit_map, fit_pca_map, predict
 from .experiment import SCENARIOS, resolve_sequence
-from .localization import capture_tail, common_prefix, discover_sites
+from .generation_evaluation import (
+    attach_candidate_agreement,
+    generate_questions,
+    generation_metrics,
+)
+from .localization import capture_tail, discover_sites
 from .reft import LoReFT, frozen_model, intervention_scores, task_locality_loss
+from .reft_localization import locate_block
 from .world import OPERATORS
 
 
@@ -143,6 +150,8 @@ def run_reft_suite(
     cfg,
     *,
     layer=12,
+    localization_layers=None,
+    max_new_tokens=16,
     strengths=None,
     pca_components=None,
     preservation_weight=1.0,
@@ -157,7 +166,10 @@ def run_reft_suite(
     pca_components = [cfg.rank] if pca_components is None else pca_components
     if any(type(k) is not int or k < 1 for k in pca_components):
         raise ValueError("PCA ranks must be positive integers")
-    site, prefix = block_site(lm, layer), common_prefix(lm)
+    if type(max_new_tokens) is not int or max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be a positive integer")
+    answer_protocol = protocol_metadata(lm)
+    prefix = []
     train = circuit_questions("train", styles=tuple(PromptStyle))
     val = circuit_questions("validation")
     methods = (
@@ -169,6 +181,12 @@ def run_reft_suite(
     )
     fitted, tensors, training, trials, selected = {}, {}, {}, {}, {}
     with frozen_model(lm):
+        site, localization = locate_block(
+            lm,
+            [layer] if localization_layers is None else localization_layers,
+            preservation_weight,
+            progress,
+        )
         base_train, base_val = evaluate(lm, train, site, prefix), evaluate(lm, val, site, prefix)
         x = capture_states(lm, [q.prompt() for q in train], site, prefix)
         for op in OPERATORS:
@@ -227,7 +245,7 @@ def run_reft_suite(
             "validation": fixed_loreft_metrics(lm, val, base_val, site, prefix, fitted),
             "test": {},
         }
-        tests, exact = {}, {}
+        tests, exact, greedy = {}, {}, {}
         for scheme in Scheme:
             progress(f"Held-out evaluation: {scheme.value}")
             samples = circuit_questions("test", scheme)
@@ -273,12 +291,27 @@ def run_reft_suite(
                             ).cpu()
                         )
                 exact[scheme.value][name] = metrics(torch.cat(rows), samples, sequence, base)
+            progress(f"Unconstrained generation: {scheme.value}")
+            greedy[scheme.value] = greedy_loreft_metrics(
+                lm,
+                samples,
+                site,
+                fitted,
+                selected,
+                tests[scheme.value],
+                fixed["test"][scheme.value],
+                max_new_tokens,
+                progress,
+            )
         restored = evaluate(lm, train, site, prefix)
         difference = float((restored - base_train).abs().max())
         if not torch.allclose(restored, base_train, atol=1e-5, rtol=1e-5):
             raise RuntimeError("LoReFT rollback failed")
     return {
-        "experiment": "loreft_causal_suite_v2",
+        "experiment": "loreft_causal_suite_v3",
+        "answer_protocol": answer_protocol,
+        "localization": localization,
+        "max_new_tokens": max_new_tokens,
         "model": {"profile": cfg.profile, "device": str(lm.device)},
         "seed": cfg.seed,
         "rank": cfg.rank,
@@ -287,7 +320,7 @@ def run_reft_suite(
         "locality_weight": cfg.locality_weight,
         "preservation_weight": preservation_weight,
         "strengths": strengths,
-        "site": {"path": site, "kind": "block", "boundary": "decision", "prefix": prefix},
+        "site": {"path": site, "kind": "block", "boundary": "prompt", "prefix": prefix},
         "train_scheme": Scheme.AND_COPY.value,
         "split": {
             "train": [q.key for q in train],
@@ -302,6 +335,7 @@ def run_reft_suite(
         "test": tests,
         "oracle_diagnostics": exact,
         "fixed_strength_diagnostics": fixed,
+        "greedy_test": greedy,
         "rollback": {"max_score_difference": difference},
         "sources": ["https://arxiv.org/abs/2404.03592", "https://arxiv.org/abs/2110.11309"],
         "limitations": [
@@ -316,10 +350,58 @@ def run_reft_suite(
             "Compositions sequentially transform the same hidden vector; they do not rerun the network between primitive operators.",
             "Revision uses external latest-write-wins resolution, not learned contradiction detection.",
             "New schemes are test-only, but all use Boolean variables and the same names. No arbitrary-text reasoning claim.",
-            "The layer was chosen after earlier experiments. One seed, small truth tables; no statistical significance claim.",
-            "Exact donors are privileged controls and do not participate in fitting or selection. Base model weights remain frozen.",
+            "Candidate layer list may reflect earlier experiments. One shared block is selected by mean validation donor-transfer objectives; this need not be the best layer for learned LoReFT. Training continues even if no donor site beats the no-patch baseline, with that outcome explicitly recorded.",
+            "Validation donors select the intervention site; test donors remain separate privileged diagnostics. Shifted schemes never participate in fitting or selection. Base model weights remain frozen.",
+            "Scoring, training and free generation intervene at the same last prompt token with bare 0/1 candidates and no forced prefix. Greedy decoding uses the full vocabulary, so it can disagree with binary ranking or fail the required format.",
+            "Greedy diagnostics evaluate primitive LoReFT operators at both selected strength and alpha=1. Compositions are still evaluated by candidate scoring only.",
+            "Truncated generation counts as incomplete even when its partial text is a digit; it is not a completed binary answer. Unaffected-answer damage is relative to correct baseline generations, not candidate predictions.",
         ],
     }, tensors
+
+
+def greedy_loreft_metrics(
+    lm, samples, site, fitted, selected, selected_scores, fixed_scores, max_new_tokens, progress
+):
+    def generate(label, transform=lambda h: h, sequence=()):
+        return generate_questions(
+            lm,
+            samples,
+            site,
+            transform,
+            sequence=sequence,
+            max_new_tokens=max_new_tokens,
+            progress=lambda message: progress(f"Greedy {label}: {message}"),
+        )
+
+    base = generate("base")
+    result = {}
+    for op in OPERATORS:
+        outputs = {"base": base, "explicit_prompt": generate(op.key + " explicit", sequence=(op,))}
+        candidates = {
+            "base": selected_scores[op.key]["base"],
+            "explicit_prompt": selected_scores[op.key]["explicit_prompt"],
+        }
+        alphas = {}
+        for method in ("loreft_task", "loreft_locality"):
+            cache = {0.0: base}
+            for mode, alpha, ranked in (
+                ("selected", selected[op.key][method]["alpha"], selected_scores[op.key][method]),
+                ("fixed", 1.0, fixed_scores[op.key][method]),
+            ):
+                name = f"{method}_{mode}"
+                if alpha not in cache:
+                    cache[alpha] = generate(
+                        op.key + " " + name, make_transform(fitted[op.key][method], method, alpha)
+                    )
+                outputs[name], candidates[name], alphas[name] = cache[alpha], ranked, alpha
+        result[op.key] = {}
+        for name, generated in outputs.items():
+            m = generation_metrics(generated, samples, (op,), base)
+            attach_candidate_agreement(m, candidates[name])
+            if name in alphas:
+                m["alpha"] = alphas[name]
+            result[op.key][name] = m
+    return result
 
 
 def fixed_loreft_metrics(lm, samples, base, site, prefix, fitted):
@@ -357,7 +439,11 @@ def save_research(root, report, tensors):
     save_file(
         tensors,
         folder / "operators.safetensors",
-        metadata={"experiment": report["experiment"], "site": json.dumps(report["site"])},
+        metadata={
+            "experiment": report["experiment"],
+            "site": json.dumps(report["site"]),
+            "answer_protocol": json.dumps(report.get("answer_protocol", {})),
+        },
     )
     lines = ["# " + report["experiment"], ""]
     if kind == "reft":
@@ -408,6 +494,36 @@ def save_research(root, report, tensors):
                         changed_text = "n/a" if changed is None else f"{changed:.3f}"
                         lines.append(
                             f"| {split} | {op} | {method} | {m['overall']['accuracy']:.3f} | {changed_text} | {m['all_nodes_correct']:.3f} | {values} |"
+                        )
+        if "localization" in report:
+            lines += [
+                "",
+                "## Bare-digit validation localization",
+                "",
+                "```json",
+                json.dumps(
+                    {k: v for k, v in report["localization"].items() if k != "trials"}, indent=2
+                ),
+                "```",
+            ]
+        if "greedy_test" in report:
+            lines += [
+                "",
+                "## Unconstrained greedy generation",
+                "",
+                "| Scheme | Operation | Mode | Accuracy | All nodes | Format errors | Incomplete | Source / switch / flag damage |",
+                "|---|---|---|---:|---:|---:|---:|---|",
+            ]
+            for scheme, operations in report["greedy_test"].items():
+                for op, modes in operations.items():
+                    for mode, m in modes.items():
+                        damage = m["protected_damage"]["by_node"]
+                        values = " / ".join(
+                            f"{damage[n]['damaged']}/{damage[n]['eligible']}"
+                            for n in ("source", "switch", "flag")
+                        )
+                        lines.append(
+                            f"| {scheme} | {op} | {mode} | {m['overall']['accuracy']:.3f} | {m['all_nodes_correct']:.3f} | {m['overall']['format_errors']} | {m['overall']['incomplete']} | {values} |"
                         )
     else:
         lines += [

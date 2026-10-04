@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import torch
 
+from .answer_protocol import BARE_CANDIDATES, parse_generation, protocol_metadata
 from .causal_tasks import PromptStyle, Scheme, answer_metrics, circuit_questions
 
 
@@ -13,7 +14,7 @@ from .causal_tasks import PromptStyle, Scheme, answer_metrics, circuit_questions
 def run_diagnostics(lm, cfg, *, max_new_tokens=16, progress=lambda _: None):
     if type(max_new_tokens) is not int or max_new_tokens < 1:
         raise ValueError("max_new_tokens must be a positive integer")
-    formats = {"spaced_candidates": (" 0", " 1"), "bare_candidates": ("0", "1")}
+    formats = {"spaced_candidates": (" 0", " 1"), "bare_candidates": BARE_CANDIDATES}
     splits = {}
     for split in ("train", "validation", "test"):
         splits[split] = {}
@@ -55,10 +56,7 @@ def run_diagnostics(lm, cfg, *, max_new_tokens=16, progress=lambda _: None):
             records = []
             for i, (record, prompt) in enumerate(zip(common, prompts, strict=True)):
                 generated = lm.generate_greedy([prompt], max_new_tokens=max_new_tokens)[0]
-                text = generated["text"].strip()
-                records.append(
-                    {**record, **generated, "prediction": int(text) if text in ("0", "1") else None}
-                )
+                records.append({**record, **parse_generation(generated)})
                 if i == 0 or (i + 1) % 20 == 0 or i + 1 == len(prompts):
                     progress(f"Baseline {split}/{scheme.value}: greedy {i + 1}/{len(prompts)}")
             modes["greedy"] = answer_metrics(records)
@@ -87,7 +85,8 @@ def run_diagnostics(lm, cfg, *, max_new_tokens=16, progress=lambda _: None):
             }
             splits[split][scheme.value] = modes
     return {
-        "experiment": "base_answer_diagnostics_v1",
+        "experiment": "base_answer_diagnostics_v2",
+        "answer_protocol": protocol_metadata(lm),
         "model": {"profile": cfg.profile, "device": str(lm.device)},
         "max_new_tokens": max_new_tokens,
         "chat_template_applied": bool(getattr(lm.tokenizer, "chat_template", None)),
@@ -100,7 +99,7 @@ def run_diagnostics(lm, cfg, *, max_new_tokens=16, progress=lambda _: None):
             "Read-only baseline audit; shifted graphs are never used for training or operator selection.",
             "Greedy decoding uses raw argmax, no forced answer prefix, no sampling, no logits processors, and no KV cache.",
             "Only a complete decoded response of 0 or 1 (ignoring surrounding whitespace and special tokens) is parsed. Other outputs count as errors.",
-            "Responses reaching the token budget are flagged and may be incomplete. Raw text and token IDs are retained.",
+            "Responses reaching the token budget are incomplete, even if the partial text is a digit; they are counted separately from completed format errors and are not accepted as complete answers.",
             "Candidate scores are separately tokenized continuation log-probabilities; normalized 0/1 probabilities are not vocabulary-wide confidence.",
             "The three wording styles share equations and variable names. Rephrased worlds are correlated observations.",
         ],
@@ -117,8 +116,8 @@ def save_diagnostics(root, report):
     lines = [
         "# Baseline answer diagnostics",
         "",
-        "| Split | Scheme | Mode | Accuracy | Errors for 0 | Errors for 1 | Invalid |",
-        "|---|---|---|---:|---:|---:|---:|",
+        "| Split | Scheme | Mode | Accuracy | Errors for 0 | Errors for 1 | Format errors | Incomplete |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for split, schemes in report["splits"].items():
         for scheme, modes in schemes.items():
@@ -127,7 +126,7 @@ def save_diagnostics(root, report):
                 lines.append(
                     f"| {split} | {scheme} | {name} | {m['overall']['accuracy']:.3f} | "
                     f"{m['by_label']['0']['errors']}/{m['by_label']['0']['count']} | "
-                    f"{m['by_label']['1']['errors']}/{m['by_label']['1']['count']} | {m['overall']['invalid']} |"
+                    f"{m['by_label']['1']['errors']}/{m['by_label']['1']['count']} | {m['overall']['format_errors']} | {m['overall']['incomplete']} |"
                 )
     lines += [
         "",

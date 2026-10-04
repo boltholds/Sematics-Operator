@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import product
 
+from .answer_protocol import ANSWER_INSTRUCTION
 from .world import Intervention, Node
 
 
@@ -12,6 +13,8 @@ class Scheme(StrEnum):
     OR_COPY = "or_copy"
     AND_GATED = "and_gated"
     AND_CHAIN = "and_chain"
+    AND_INVERTED = "and_inverted"
+    AND_XOR = "and_xor"
 
 
 class CircuitNode(StrEnum):
@@ -46,6 +49,10 @@ class CircuitWorld:
         )
         relay = overrides.get("relay", relay)
         lamp = relay & self.flag if self.scheme == Scheme.AND_GATED else relay
+        if self.scheme == Scheme.AND_INVERTED:
+            lamp = 1 - relay
+        elif self.scheme == Scheme.AND_XOR:
+            lamp = relay ^ self.flag
         values = {
             CircuitNode.SOURCE: self.source,
             CircuitNode.SWITCH: self.switch,
@@ -93,6 +100,10 @@ class CircuitQuestion:
             rules += "lamp = relay AND flag. "
         elif w.scheme == Scheme.AND_CHAIN:
             rules += "bridge = relay; lamp = bridge. "
+        elif w.scheme == Scheme.AND_INVERTED:
+            rules += "lamp = NOT relay (NOT 0 = 1; NOT 1 = 0). "
+        elif w.scheme == Scheme.AND_XOR:
+            rules += "lamp = relay XOR flag (XOR is 1 exactly when its inputs differ). "
         else:
             rules += "lamp = relay. "
         facts = f"source={w.source}; switch={w.switch}; flag={w.flag}. "
@@ -126,14 +137,7 @@ class CircuitQuestion:
                 + "; ".join(f"force {n.value}={v}" for n, v in overrides.items())
                 + ". "
             )
-        question = {
-            "train": f"Give the value of {self.node.value} as 0 or 1.",
-            "validation": f"Return only the binary value of {self.node.value}.",
-            "test": f"Which value, 0 or 1, does {self.node.value} have? Reply with one digit.",
-        }[self.split]
-        if self.style == PromptStyle.DEFAULT:
-            question = f"What is {self.node.value}? Answer with only 0 or 1."
-        return text + question + "\nAnswer:"
+        return text + f"What is {self.node.value}? " + ANSWER_INSTRUCTION + "\nAnswer:"
 
 
 def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFAULT,)):
@@ -141,7 +145,8 @@ def circuit_questions(split, scheme=Scheme.AND_COPY, *, styles=(PromptStyle.DEFA
         raise ValueError("Unknown split")
     if split != "test" and scheme != Scheme.AND_COPY:
         raise ValueError("Shifted schemes are test-only")
-    if not styles or len(set(styles)) != len(styles) or any(s not in PromptStyle for s in styles):
+    styles = tuple(PromptStyle(s) for s in styles)
+    if not styles or len(set(styles)) != len(styles):
         raise ValueError("Provide unique prompt styles")
     result = []
     for i, values in enumerate(product((0, 1), repeat=3)):
@@ -220,6 +225,8 @@ def answer_metrics(records):
             "accuracy": correct / len(rows) if rows else None,
             "errors": len(rows) - correct,
             "invalid": sum(r["prediction"] is None for r in rows),
+            "incomplete": sum(r.get("generation_status") == "incomplete" for r in rows),
+            "format_errors": sum(r.get("generation_status") == "format_error" for r in rows),
         }
 
     nodes = dict.fromkeys(r["node"] for r in records)

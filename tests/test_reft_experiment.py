@@ -27,6 +27,9 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
                 str(env),
                 "--layers",
                 "0",
+                "1",
+                "--max-new-tokens",
+                "1",
                 "--rank",
                 "2",
                 "--steps",
@@ -47,13 +50,39 @@ def test_reft_suite_keeps_shifted_schemes_out_of_training_and_saves(tmp_path):
     report = json.loads(path.read_text())
     assert report["locality_weight"] == report["preservation_weight"] == 1
     assert report["train_scheme"] == "and_copy"
-    assert set(report["test"]) == {"and_copy", "or_copy", "and_gated", "and_chain"}
+    assert set(report["test"]) == {
+        "and_copy",
+        "or_copy",
+        "and_gated",
+        "and_chain",
+        "and_inverted",
+        "and_xor",
+    }
     assert set(report["training"]["relay_0"]) == {"loreft_task", "loreft_locality"}
     assert all(
         entry["alpha"] == 0 for choices in report["selected"].values() for entry in choices.values()
     )
     assert report["rollback"]["max_score_difference"] == 0
-    assert report["experiment"] == "loreft_causal_suite_v2"
+    assert report["experiment"] == "loreft_causal_suite_v3"
+    assert report["answer_protocol"]["candidates"] == ["0", "1"]
+    assert report["site"]["boundary"] == "prompt"
+    assert report["site"]["prefix"] == []
+    location = report["localization"]
+    assert location["candidate_layers"] == [0, 1]
+    assert location["selected_layer"] in (0, 1)
+    for trial in location["trials"]:
+        assert trial["self_patch_max_score_difference"] < 1e-5
+        assert all(
+            record["key"].startswith("validation_and_copy_")
+            for m in trial["by_operator"].values()
+            for record in m["records"]
+        )
+    assert set(report["greedy_test"]) == set(report["test"])
+    for ops in report["greedy_test"].values():
+        for modes in ops.values():
+            assert modes["loreft_locality_selected"]["records"] == modes["base"]["records"]
+            assert "incomplete" in modes["loreft_locality_fixed"]["overall"]
+            assert "source" in modes["loreft_locality_fixed"]["protected_damage"]["by_node"]
     fixed = report["fixed_strength_diagnostics"]
     assert fixed["alpha"] == 1
     assert set(fixed["test"]) == set(report["test"])
@@ -92,7 +121,9 @@ def test_das_targets_are_base_counterfactuals_not_source_answers(tmp_path):
     assert {p.intervention.value for p in pairs} == {0, 1}
     lm = tiny_model()
     report, tensors = run_das(lm, Settings("tiny", tmp_path, steps=2, rank=2), layer=0)
-    assert report["experiment"] == "das_causal_alignment_v1"
+    assert report["experiment"] == "das_causal_alignment_v2"
+    assert report["answer_protocol"]["candidates"] == ["0", "1"]
+    assert report["site"]["prefix"] == []
     assert report["rollback"]["max_score_difference"] == 0
     for scheme, nodes in report["test"].items():
         for methods in nodes.values():
