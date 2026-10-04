@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from safetensors.torch import save_file
 
+from .heatmap_directions import anchor_deltas, compare_directions
 from .heatmaps import DEFAULT_TEMPLATE, aligned_matrices, compare_pair
 
 
@@ -160,6 +161,90 @@ def _render_pair(folder, pair, tensors):
         _metrics_plot(folder / pair["metrics_image"], pair["layers"], title)
 
 
+def _direction_plot(path, cross):
+    Figure, Canvas = _plotting()
+    comparisons = cross["comparisons"]
+    columns = len(comparisons)
+    values = np.array(
+        [
+            [layer["cosine"][c["left"]][c["right"]] for c in comparisons]
+            for layer in cross["layers"]
+        ],
+        dtype=float,
+    )
+    figure = Figure(figsize=(max(6, 1.1 * columns + 2), max(4, 0.36 * len(values) + 2)), dpi=140)
+    Canvas(figure)
+    ax = figure.subplots()
+    from matplotlib import colormaps
+
+    cmap = colormaps["RdBu_r"].copy()
+    cmap.set_bad("#d4d7db")
+    view = ax.imshow(
+        np.ma.masked_invalid(values),
+        vmin=-1,
+        vmax=1,
+        cmap=cmap,
+        aspect="auto",
+        interpolation="nearest",
+    )
+    ax.set_xticks(range(columns), [f"{c['left'] + 1} vs {c['right'] + 1}" for c in comparisons])
+    ax.set_yticks(range(len(values)), [str(l["index"]) for l in cross["layers"]])
+    ax.set_xlabel("Pair indices (see report for words and anchor positions)")
+    ax.set_ylabel("Block index (zero-based)")
+    ax.set_title("Cross-pair delta directions: cosine(B - A, B - A)")
+    for row in range(len(values)):
+        for col in range(columns):
+            value = values[row, col]
+            label = f"{value:.2f}" if np.isfinite(value) else "N/A"
+            ax.text(
+                col,
+                row,
+                label,
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="white" if np.isfinite(value) and abs(value) > 0.65 else "black",
+            )
+    figure.colorbar(view, ax=ax, pad=0.03).set_label("Cosine of delta directions")
+    figure.tight_layout()
+    figure.savefig(path)
+    figure.clear()
+
+
+def _direction_gallery(cross):
+    esc = html.escape
+    parts = [
+        '<section id="directions"><h2>Сходство направлений дельт между парами</h2>',
+        (
+            "<p>Сравнивается cos(Δ₁, Δ₂) на последнем общем токене, где Δ = B − A. "
+            "+1 — одно направление, 0 — ортогональные направления, −1 — противоположные. "
+            "N/A — нет сопоставимого токена, нулевая дельта или сигнал не выше порога повторного прогона. "
+            "Нулевая дельта не считается совпадением направлений.</p><ol>"
+        ),
+    ]
+    for pair in cross["pairs"]:
+        parts.append(
+            f"<li>{esc(pair['label'])}; позиции A/B: {esc(str(pair['anchor_positions']))}; "
+            f"число токенов: {esc(str(pair['token_counts']))}; ID общего токена: {pair['anchor_token_id']}</li>"
+        )
+    parts.append("</ol>")
+    parts.extend(f"<p><strong>{esc(w)}</strong></p>" for w in cross["warnings"])
+    parts.append(
+        "<p>Порядок слов во всех языках должен задавать одинаковое смысловое направление. "
+        "Шкала фиксирована: от −1 до +1. Смена токенизации и позиций может влиять на сходство. "
+        "Высокое сходство само по себе не доказывает причинную роль или универсальность операции.</p>"
+    )
+    parts.append(
+        f'<a href="{cross["image"]}"><img src="{cross["image"]}" alt="Сходство направлений дельт по блокам"></a>'
+    )
+    if cross["tensor_file"]:
+        parts.append(
+            f'<p><a href="{cross["tensor_file"]}">Векторы дельт для самостоятельного анализа</a></p>'
+        )
+    parts.append("</section>")
+    return parts
+
+
 def _gallery(report):
     esc = lambda value: html.escape(str(value), quote=True)
     parts = [
@@ -181,6 +266,8 @@ def _gallery(report):
         name = " / ".join(pair["inputs"][s]["word"] for s in ("a", "b"))
         parts.append(f'<a href="#pair-{i}">{esc(name)}</a> · ')
     parts.append("</nav>")
+    if report.get("cross_pair_directions"):
+        parts.extend(_direction_gallery(report["cross_pair_directions"]))
     for i, pair in enumerate(report["pairs"]):
         parts.append(f'<section id="pair-{i}"><h2>Пара {i + 1}</h2>')
         for side in ("a", "b"):
@@ -250,12 +337,14 @@ def run_heatmaps(
         "delta": "B - A; unmatched rows are NaN in tensors and grey in PNG",
         "coordinate_reduction": "none",
         "pairs": [],
+        "cross_pair_directions": None,
         "limitations": [
             "Descriptive input contrast; no learned operator or causal intervention.",
             "Hidden coordinates are basis-dependent, not named concepts.",
             "Token alignment is lexical/positional, not a semantic alignment algorithm.",
         ],
     }
+    directions = []
     for i, pair in enumerate(pairs):
         progress(f"Heatmap pair {i + 1}/{len(pairs)}: {pair[0]!a} -> {pair[1]!a}")
         item, tensors = compare_pair(
@@ -268,6 +357,7 @@ def run_heatmaps(
         )
         _render_pair(folder, item, tensors)
         report["pairs"].append(item)
+        directions.append(anchor_deltas(item, tensors))
         # Checkpoint each pair, and release tensors before processing the next pair.
         (folder / "report.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
@@ -275,4 +365,29 @@ def run_heatmaps(
         )
         (folder / "index.html").write_text(_gallery(report), encoding="utf-8")
         del tensors
+    if len(pairs) > 1:
+        cross = compare_directions(report["pairs"], directions)
+        cross["image"] = "cross_pair_cosines.png"
+        compact = {
+            f"pair_{i:03d}.layer_{index:03d}.delta": value
+            for i, pair in enumerate(directions)
+            for index, value in pair.items()
+        }
+        cross["tensor_file"] = "anchor_deltas.safetensors" if compact else None
+        if compact:
+            save_file(
+                compact,
+                folder / cross["tensor_file"],
+                metadata={
+                    "delta": "B - A at each pair's last shared suffix token",
+                    "indices": "zero-based pair and block indices",
+                },
+            )
+        _direction_plot(folder / cross["image"], cross)
+        report["cross_pair_directions"] = cross
+        (folder / "report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        (folder / "index.html").write_text(_gallery(report), encoding="utf-8")
     return folder
