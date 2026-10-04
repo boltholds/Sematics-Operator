@@ -95,6 +95,14 @@ def test_cli_compare_saves_transition_parameters(tmp_path):
         main(
             [
                 "compare",
+                "--site-kind",
+                "block",
+                "--layers",
+                "1",
+                "--boundary",
+                "decision",
+                "--preservation-weight",
+                "1",
                 "--config",
                 str(config),
                 "--env-file",
@@ -110,7 +118,10 @@ def test_cli_compare_saves_transition_parameters(tmp_path):
     )
     path = next((tmp_path / "runs").glob("*-compare-*/report.json"))
     report = json.loads(path.read_text())
-    assert report["experiment"] == "state_conditioned_activation_v2"
+    assert report["experiment"] == "state_conditioned_activation_v3"
+    assert report["site"]["kind"] == "block"
+    assert report["site"]["boundary"] == "decision"
+    assert report["preservation_weight"] == 1
     from safetensors.torch import load_file
 
     assert any(

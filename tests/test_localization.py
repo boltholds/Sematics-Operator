@@ -35,6 +35,10 @@ def test_shared_answer_prefix_and_terminal_block_transfer():
         transferred.softmax(-1), lm.scores(source).softmax(-1).detach().cpu(), atol=1e-6
     )
     neutral = capture_tail(lm, target, [site], 2, prefix)
+    added = patched_scores(
+        lm, target, {site: donor[site] - neutral[site]}, [site], 2, prefix, replace=False
+    )
+    assert torch.allclose(added, transferred, atol=1e-6)
     assert torch.allclose(
         patched_scores(lm, target, neutral, [site], 2, prefix),
         lm.scores(target).detach().cpu(),

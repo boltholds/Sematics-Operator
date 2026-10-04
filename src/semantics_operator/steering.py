@@ -251,8 +251,9 @@ def save_steering(root, report, vectors):
         vectors,
         folder / ("transitions.safetensors" if conditional else "vectors.safetensors"),
         metadata={
-            "position": "last prompt token",
-            "space": "MLP output",
+            "position": report.get("site", {}).get("boundary", "prompt"),
+            "space": report.get("site", {}).get("kind", "mlp"),
+            "site_json": json.dumps(report.get("site", {})),
             "experiment": report["experiment"],
         },
     )
@@ -289,6 +290,29 @@ def save_steering(root, report, vectors):
         "## Limitations",
         "",
     ] + ["- " + s for s in report["limitations"]]
+    if "site" in report:
+        lines += [
+            "",
+            "## Injection site",
+            "",
+            "```json",
+            json.dumps(report["site"], indent=2),
+            "```",
+            "",
+            report["selection"],
+            f"Preservation weight: {report['preservation_weight']}",
+            "",
+            "## Protected source / switch / flag damage",
+            "",
+            "| Scenario | Method | Newly wrong | Previously correct | Damage rate |",
+            "|---|---|---:|---:|---:|",
+        ]
+        for name, scenario in report["scenarios"].items():
+            for method, metrics in scenario.items():
+                d = metrics["protected_damage"]
+                lines.append(
+                    f"| {name} | {method} | {d['damaged']} | {d['eligible']} | {d['rate']:.3f} |"
+                )
     if report.get("oracle_diagnostics"):
         lines += [
             "",

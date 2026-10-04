@@ -60,7 +60,7 @@ def capture_tail(lm, prompts, sites, window, prefix):
 
 
 @torch.no_grad()
-def patched_scores(lm, prompts, donor, sites, window, prefix):
+def patched_scores(lm, prompts, donor, sites, window, prefix, *, replace=True):
     ends = [len(lm._prompt_ids(p)) + len(prefix) for p in prompts for _ in (0, 1)]
     handles = []
     try:
@@ -70,7 +70,10 @@ def patched_scores(lm, prompts, donor, sites, window, prefix):
                 tensor = hidden(output).clone()
                 values = donor[site][:, -window:].repeat_interleave(2, dim=0).to(tensor)
                 for row, end in enumerate(ends):
-                    tensor[row, end - window : end] = values[row]
+                    if replace:
+                        tensor[row, end - window : end] = values[row]
+                    else:
+                        tensor[row, end - window : end] += values[row]
                 if isinstance(output, tuple):
                     return (tensor, *output[1:])
                 if isinstance(output, list):

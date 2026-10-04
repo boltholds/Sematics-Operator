@@ -84,3 +84,62 @@ def test_exact_donor_replacement_preserves_identical_prompt_scores():
     actual = row_scores(lm, samples, {layer: donor}, replace=True)
     assert torch.allclose(actual, original, atol=1e-6)
     assert not lm.model.get_submodule(layer)._forward_hooks
+
+
+def test_protected_damage_penalizes_only_new_errors_on_protected_nodes():
+    from semantics_operator.conditional import penalized_selection, protected_damage
+    from semantics_operator.world import OPERATORS, questions
+
+    samples = questions("test")
+    baseline = torch.tensor([[1 - q.answer(), q.answer()] for q in samples]).float()
+    damaged = baseline.clone()
+    damaged[0] = damaged[0].flip(0)  # source
+    damaged[2] = damaged[2].flip(0)  # relay: not a protected node
+    metric = protected_damage(damaged, samples, baseline)
+    assert metric["damaged"] == 1
+    assert metric["eligible"] == 24
+    assert metric["by_node"]["source"]["damaged"] == 1
+    plain = penalized_selection(damaged, samples, OPERATORS[0], baseline, 0)
+    penalized = penalized_selection(damaged, samples, OPERATORS[0], baseline, 2)
+    assert abs(plain[0] - penalized[0] - 2 / 24) < 1e-7
+    assert protected_damage(damaged, samples, damaged)["damaged"] == 0
+
+
+def test_block_decision_comparison_zero_and_terminal_oracle(tmp_path):
+    lm = tiny_model()
+    original = lm.tokenizer
+
+    class Tokenizer:
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def encode(self, text, **kwargs):
+            if text in (" 0", " 1"):
+                return [4, 2 if text == " 0" else 3]
+            return original.encode(text, **kwargs)
+
+    lm.tokenizer = Tokenizer()
+    before = {k: v.clone() for k, v in lm.model.state_dict().items()}
+    report, _ = run_conditional(
+        lm,
+        Settings("tiny", tmp_path),
+        layers=["1"],
+        site_kind="block",
+        boundary="decision",
+        preservation_weight=1,
+        strengths=[0],
+        pca_components=[2],
+    )
+    assert report["site"]["common_candidate_prefix"] == [4]
+    assert report["layers"] == ["model.layers.1"]
+    for name, methods in report["scenarios"].items():
+        for method in ("constant", "conditional", "pca_2"):
+            assert methods[method]["records"] == methods["base"]["records"]
+            assert methods[method]["protected_damage"]["damaged"] == 0
+        donor = report["oracle_diagnostics"]["model.layers.1"][name]["records"]
+        explicit = methods["explicit_prompt"]["records"]
+        assert max(abs(a["p1"] - b["p1"]) for a, b in zip(donor, explicit)) < 1e-5
+    assert report["rollback"]["max_score_difference"] == 0
+    for k, v in before.items():
+        assert torch.equal(v, lm.model.state_dict()[k])
+    assert not lm.model.get_submodule("model.layers.1")._forward_hooks

@@ -16,7 +16,22 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--layers",
         nargs="+",
-        help="MLP module paths for steering; default: all recognized MLP outputs",
+        help="MLP module paths; for compare --site-kind block: block indices or paths",
+    )
+    parser.add_argument(
+        "--site-kind", choices=("mlp", "block"), default="mlp", help="compare injection site"
+    )
+    parser.add_argument(
+        "--boundary",
+        choices=("prompt", "decision"),
+        default="prompt",
+        help="compare position: last prompt or shared answer prefix",
+    )
+    parser.add_argument(
+        "--preservation-weight",
+        type=float,
+        default=0.0,
+        help="compare validation penalty for new source/switch/flag errors",
     )
     parser.add_argument(
         "--strengths", nargs="+", type=float, help="Validation steering grid; zero always included"
@@ -87,6 +102,9 @@ def main(argv=None) -> int:
                 strengths=args.strengths,
                 ridge=args.ridge,
                 pca_components=args.pca_components,
+                site_kind=args.site_kind,
+                boundary=args.boundary,
+                preservation_weight=args.preservation_weight,
                 progress=print,
             )
             folder = save_steering(cfg.output_dir, report, tensors)
