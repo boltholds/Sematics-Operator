@@ -10,17 +10,39 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Reversible weight-space semantic experiments")
     parser.add_argument(
         "command",
-        choices=("inspect", "run", "steer", "compare", "localize", "reft", "das", "diagnose"),
+        choices=(
+            "inspect",
+            "run",
+            "steer",
+            "compare",
+            "localize",
+            "reft",
+            "das",
+            "diagnose",
+            "transfer",
+        ),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/experiment.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default="", help="Named model profile in TOML")
     parser.add_argument("--steps", type=int, help="Override steps per primitive operator")
-    parser.add_argument("--rank", type=int, help="Low-rank dimension for run/reft/das")
+    parser.add_argument("--rank", type=int, help="Low-rank dimension for run/reft/das/transfer")
     parser.add_argument("--learning-rate", type=float, help="Training learning rate")
     parser.add_argument("--locality-weight", type=float, help="Training locality loss weight")
     parser.add_argument(
-        "--max-new-tokens", type=int, default=16, help="Greedy token budget for diagnose/reft"
+        "--seed", type=int, help="Override experiment and operator initialization seed"
+    )
+    parser.add_argument(
+        "--train-representation",
+        choices=("en", "ru", "symbolic"),
+        default="en",
+        help="transfer: sole training/validation representation; all three are evaluated",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=16,
+        help="Greedy token budget for diagnose/reft/transfer",
     )
     parser.add_argument(
         "--intervention-audit",
@@ -31,7 +53,7 @@ def main(argv=None) -> int:
         "--loss-mode",
         choices=("full_vocab", "binary"),
         default="full_vocab",
-        help="reft: digit+EOS full-vocabulary loss (default) or binary-candidate ablation",
+        help="reft/transfer: digit+EOS full-vocabulary loss (default) or binary-candidate ablation",
     )
     parser.add_argument(
         "--train-schemes",
@@ -44,12 +66,12 @@ def main(argv=None) -> int:
         "--reft-position",
         choices=("state", "answer"),
         default="state",
-        help="reft: edit the shared state before the question (default), or the answer position on identical prompts",
+        help="reft/transfer: edit the shared state before the question (default), or the answer position on identical prompts",
     )
     parser.add_argument(
         "--layers",
         nargs="+",
-        help="MLP paths; compare block: indices/paths; reft: block candidates; das: one block (default 12)",
+        help="MLP paths; compare: indices/paths; reft: candidate blocks; das: one block (default 12); transfer: one fixed block (default 8)",
     )
     parser.add_argument(
         "--site-kind", choices=("mlp", "block"), default="mlp", help="compare injection site"
@@ -63,8 +85,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--preservation-weight",
         type=float,
-        default=0.0,
-        help="Validation damage penalty: all unaffected nodes for reft; source/switch/flag for compare",
+        default=None,
+        help="Validation damage penalty (transfer default 1, others 0): all unaffected nodes for reft/transfer; source/switch/flag for compare",
     )
     parser.add_argument(
         "--strengths", nargs="+", type=float, help="Validation steering grid; zero always included"
@@ -92,17 +114,40 @@ def main(argv=None) -> int:
         help="Patch before or after common answer prefix",
     )
     args = parser.parse_args(argv)
+    preservation_weight = args.preservation_weight
+    if preservation_weight is None:
+        preservation_weight = 1.0 if args.command == "transfer" else 0.0
     try:
         cfg = load_settings(args.config, args.env_file, args.model)
         if args.steps is not None:
             cfg = replace(cfg, steps=args.steps)
-        for key in ("rank", "learning_rate", "locality_weight"):
+        for key in ("rank", "learning_rate", "locality_weight", "seed"):
             value = getattr(args, key)
             if value is not None:
                 cfg = replace(cfg, **{key: value})
         from .model import LocalLanguageModel
 
+        if args.command == "transfer" and args.layers and len(args.layers) != 1:
+            raise ValueError("transfer requires one predeclared block, e.g. --layers 8")
         lm = LocalLanguageModel.load(cfg)
+        if args.command == "transfer":
+            from .transfer_experiment import run_transfer
+            from .transfer_reporting import save_transfer
+
+            report, tensors = run_transfer(
+                lm,
+                cfg,
+                layer=int(args.layers[0]) if args.layers else 8,
+                train_representation=args.train_representation,
+                strengths=args.strengths,
+                preservation_weight=preservation_weight,
+                position=args.reft_position,
+                max_new_tokens=args.max_new_tokens,
+                loss_mode=args.loss_mode,
+                progress=print,
+            )
+            print(f"Results: {save_transfer(cfg.output_dir, report, tensors)}")
+            return 0
         if args.command == "diagnose":
             if args.intervention_audit:
                 from .intervention_diagnostics import (
@@ -135,7 +180,7 @@ def main(argv=None) -> int:
                     max_new_tokens=args.max_new_tokens,
                     strengths=args.strengths,
                     pca_components=args.pca_components or None,
-                    preservation_weight=args.preservation_weight,
+                    preservation_weight=preservation_weight,
                     progress=print,
                     loss_mode=args.loss_mode,
                     train_schemes=args.train_schemes,
@@ -185,7 +230,7 @@ def main(argv=None) -> int:
                 pca_components=args.pca_components,
                 site_kind=args.site_kind,
                 boundary=args.boundary,
-                preservation_weight=args.preservation_weight,
+                preservation_weight=preservation_weight,
                 progress=print,
             )
             folder = save_steering(cfg.output_dir, report, tensors)

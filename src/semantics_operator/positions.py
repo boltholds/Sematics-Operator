@@ -4,6 +4,7 @@ from enum import StrEnum
 from weakref import WeakKeyDictionary
 
 STATE_MARKER = "\nState recorded."
+NEUTRAL_STATE_MARKER = "\n###"
 _POSITION_CACHES = WeakKeyDictionary()
 
 
@@ -27,8 +28,10 @@ def _resolve_position(lm, prompt, position):
     ids = lm._prompt_ids(prompt)
     if position == ReftPosition.ANSWER:
         return len(ids) - 1
-    if prompt.count(STATE_MARKER) != 1:
+    markers = [m for m in (STATE_MARKER, NEUTRAL_STATE_MARKER) if m in prompt]
+    if len(markers) != 1 or prompt.count(markers[0]) != 1:
         raise ValueError("State intervention needs exactly one state boundary marker")
+    marker = markers[0]
     chat = bool(getattr(lm.tokenizer, "chat_template", None))
     rendered = (
         lm.tokenizer.apply_chat_template(
@@ -39,7 +42,7 @@ def _resolve_position(lm, prompt, position):
     )
     if rendered.count(prompt) != 1:
         raise ValueError("Chat template must preserve the user prompt exactly once")
-    boundary = rendered.index(prompt) + prompt.index(STATE_MARKER) + len(STATE_MARKER)
+    boundary = rendered.index(prompt) + prompt.index(marker) + len(marker)
     if not getattr(lm.tokenizer, "is_fast", False):
         raise ValueError("State intervention requires a fast tokenizer with character offsets")
     encoded = lm.tokenizer(rendered, add_special_tokens=not chat, return_offsets_mapping=True)
